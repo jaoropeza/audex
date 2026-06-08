@@ -1,3 +1,7 @@
 faster-whisper==1.1.1
 numpy>=1.24,<3
-requests
+
+# GPU support (CUDA 12.x wheels work on CUDA 13.x drivers via backward compatibility)
+# Install separately — pip cannot resolve the custom index automatically:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0

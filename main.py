@@ -1,10 +1,14 @@
+import os
 import subprocess
 import queue
 import threading
 import time
 import sys
+import re
 import argparse
 from datetime import datetime
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -33,8 +37,18 @@ OUTPUT_FILE = "transcript.txt"
 def list_audio_devices():
     """Lists available DirectShow audio input devices via ffmpeg."""
     print("Querying available audio devices...\n")
+
+    # Check ffmpeg is reachable first
+    try:
+        subprocess.run([FFMPEG_PATH, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print("[ERROR] ffmpeg not found. Install it and add it to your PATH.")
+        print("  Download: https://www.gyan.dev/ffmpeg/builds/")
+        return []
+
+    # NOTE: do NOT use -hide_banner here — it can suppress dshow device output
     command = [
-        FFMPEG_PATH, "-hide_banner",
+        FFMPEG_PATH,
         "-list_devices", "true",
         "-f", "dshow",
         "-i", "dummy"
@@ -45,20 +59,38 @@ def list_audio_devices():
         stderr=subprocess.PIPE
     )
     output = result.stderr.decode(errors="ignore")
-    in_audio = False
+
     devices = []
+
+    # ffmpeg >= 7.x: `"Device Name" (audio)` on each line (no separate sections)
     for line in output.splitlines():
-        if "DirectShow audio devices" in line:
-            in_audio = True
-            continue
-        if in_audio and "DirectShow video devices" in line:
-            break
-        if in_audio and '"' in line:
-            name = line.split('"')[1]
+        m = re.search(r'"(.+?)"\s+\(audio\)', line)
+        if m:
+            name = m.group(1)
             devices.append(name)
             print(f'  "{name}"')
+
+    # ffmpeg < 7.x fallback: separate "DirectShow audio devices" section
     if not devices:
-        print("  No audio devices found (or ffmpeg is not in PATH).")
+        in_audio = False
+        for line in output.splitlines():
+            if "DirectShow audio devices" in line:
+                in_audio = True
+                continue
+            if not in_audio or "Alternative name" in line:
+                continue
+            m = re.search(r'"([^@][^"]*)"', line)
+            if m:
+                name = m.group(1)
+                devices.append(name)
+                print(f'  "{name}"')
+
+    if not devices:
+        print("  No audio devices found.\n")
+        print("  Raw ffmpeg output (for diagnosis):")
+        for line in output.splitlines():
+            print(f"    {line}")
+
     return devices
 
 
@@ -67,14 +99,24 @@ def list_audio_devices():
 # =========================
 
 def detect_device():
-    """Returns ('cuda', 'float16') if a CUDA GPU is available, else ('cpu', 'int8')."""
+    """Returns ('cuda', 'float16') if a CUDA GPU is available, else ('cpu', 'int8').
+
+    Uses CTranslate2 (the actual faster-whisper backend) for detection,
+    with a torch fallback for the GPU name display.
+    """
     try:
-        import torch
-        if torch.cuda.is_available():
-            gpu = torch.cuda.get_device_name(0)
-            print(f"[INFO] GPU detected: {gpu} — using CUDA/float16")
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            gpu_name = "unknown GPU"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_name = torch.cuda.get_device_name(0)
+            except ImportError:
+                pass
+            print(f"[INFO] GPU detected: {gpu_name} — using CUDA/float16")
             return "cuda", "float16"
-    except ImportError:
+    except (ImportError, Exception):
         pass
     print("[INFO] No CUDA GPU detected — using CPU/int8")
     return "cpu", "int8"
