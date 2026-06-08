@@ -1,5 +1,6 @@
 faster-whisper==1.1.1
 numpy>=1.24,<3
+pyaudiowpatch>=0.2.12
 
 # GPU support (CUDA 12.x wheels work on CUDA 13.x drivers via backward compatibility)
 # Install separately — pip cannot resolve the custom index automatically:
