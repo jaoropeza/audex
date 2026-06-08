@@ -181,7 +181,7 @@ def ffmpeg_error_reader(process, stop_event):
             print(f"[FFMPEG] {message}")
 
 
-def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, debug=False):
+def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, label="", debug=False):
     previous_overlap = b""
     chunk_count = 0
     silent_streak = 0
@@ -205,10 +205,11 @@ def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, d
             silent_streak = 0
 
         if debug:
+            tag = f"{label} " if label else ""
             bar = "#" * int(max(0, (db + 60) / 2))
-            print(f"[AUDIO] chunk={chunk_count:4d}  RMS={rms:7.1f}  {db:6.1f} dB  |{bar:<30}|")
+            print(f"[AUDIO {tag}] chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|")
 
-        audio_queue.put(previous_overlap + raw_chunk)
+        audio_queue.put((label, previous_overlap + raw_chunk))
         previous_overlap = raw_chunk[-overlap_bytes:] if len(raw_chunk) >= overlap_bytes else raw_chunk
 
     stop_event.set()
@@ -219,7 +220,7 @@ def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, d
 # =========================
 
 def loopback_reader(audio_queue, stop_event, device_name=None, chunk_seconds=DEFAULT_CHUNK_SECONDS,
-                    overlap_seconds=DEFAULT_OVERLAP_SECONDS, debug=False):
+                    overlap_seconds=DEFAULT_OVERLAP_SECONDS, label="", debug=False):
     """Captures speaker output via WASAPI loopback using pyaudiowpatch."""
     try:
         import pyaudiowpatch as pyaudio
@@ -302,10 +303,11 @@ def loopback_reader(audio_queue, stop_event, device_name=None, chunk_seconds=DEF
                 silent_streak = 0
 
             if debug:
+                tag = f"{label} " if label else ""
                 bar = "#" * int(max(0, (db + 60) / 2))
-                print(f"[AUDIO] chunk={chunk_count:4d}  RMS={rms:7.1f}  {db:6.1f} dB  |{bar:<30}|")
+                print(f"[AUDIO {tag}] chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|")
 
-            audio_queue.put(previous_overlap + chunk)
+            audio_queue.put((label, previous_overlap + chunk))
             previous_overlap = chunk[-overlap_bytes:] if len(chunk) >= overlap_bytes else chunk
 
         return (None, pyaudio.paContinue)
@@ -341,10 +343,9 @@ def pcm_to_float32(raw_audio):
     return arr.astype(np.float32) / 32768.0
 
 
-def append_transcript(text, output_file):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def append_transcript(line, output_file):
     with open(output_file, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {text}\n")
+        f.write(line + "\n")
 
 
 def transcriber(audio_queue, stop_event, model_size, device, compute_type, language, output_file):
@@ -354,7 +355,7 @@ def transcriber(audio_queue, stop_event, model_size, device, compute_type, langu
 
     while not stop_event.is_set():
         try:
-            raw_audio = audio_queue.get(timeout=1)
+            label, raw_audio = audio_queue.get(timeout=1)
         except queue.Empty:
             continue
 
@@ -374,8 +375,10 @@ def transcriber(audio_queue, stop_event, model_size, device, compute_type, langu
             text = " ".join(s.text.strip() for s in segments if s.text.strip())
             if text:
                 ts = datetime.now().strftime("%H:%M:%S")
-                print(f"[{ts}] {text}")
-                append_transcript(text, output_file)
+                prefix = f"[{label}]" if label else ""
+                line = f"[{ts}]{prefix} {text}"
+                print(line)
+                append_transcript(line, output_file)
         except Exception as e:
             print(f"[ERROR] Transcription failed: {e}")
 
@@ -398,8 +401,17 @@ def parse_args():
     )
     parser.add_argument(
         "--loopback", action="store_true",
-        help="Capture speaker output (WASAPI loopback) instead of microphone input. "
+        help="Capture speaker output (WASAPI loopback) instead of microphone. "
              "Omit --device to auto-select the default output device.",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Capture both microphone and speakers simultaneously. "
+             "Use --mic for the microphone device and --device for the speaker (optional).",
+    )
+    parser.add_argument(
+        "--mic", type=str, default=None,
+        help="Microphone device name for --merge mode.",
     )
     parser.add_argument(
         "--model", "-m", type=str, default=DEFAULT_MODEL,
@@ -441,13 +453,18 @@ def main():
         list_audio_devices()
         return
 
-    if not args.loopback and not args.device:
+    if args.merge and not args.mic:
+        print("[ERROR] --merge requires --mic <microphone device name>.")
+        print('Example: python main.py --merge --mic "Microphone (HyperX Quadcast)"\n')
+        sys.exit(1)
+
+    if not args.loopback and not args.merge and not args.device:
         print("[ERROR] No audio device specified.")
         print("Run --list-devices to see available devices.\n")
         print("Examples:")
-        print('  python main.py --device "Microphone (HyperX Quadcast)"')
-        print('  python main.py --loopback                          # default speakers')
-        print('  python main.py --loopback --device "Headphones"   # specific output\n')
+        print('  python main.py --device "Microphone (HyperX Quadcast)"        # mic only')
+        print('  python main.py --loopback                                      # speakers only')
+        print('  python main.py --merge --mic "Microphone (HyperX Quadcast)"   # both\n')
         sys.exit(1)
 
     if args.cpu:
@@ -461,13 +478,27 @@ def main():
 
     audio_queue = queue.Queue()
     stop_event = threading.Event()
-
     threads = []
+    process = None
 
-    if args.loopback:
+    if args.merge:
+        # Both microphone and speaker loopback, labeled separately
+        process = start_ffmpeg(args.mic, debug=args.debug_audio)
+        threads.append(threading.Thread(target=ffmpeg_error_reader, args=(process, stop_event), daemon=True))
+        threads.append(threading.Thread(
+            target=audio_reader,
+            args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, "MIC", args.debug_audio),
+            daemon=True,
+        ))
         threads.append(threading.Thread(
             target=loopback_reader,
-            args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, args.debug_audio),
+            args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, "SPK", args.debug_audio),
+            daemon=True,
+        ))
+    elif args.loopback:
+        threads.append(threading.Thread(
+            target=loopback_reader,
+            args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, "", args.debug_audio),
             daemon=True,
         ))
     else:
@@ -475,7 +506,7 @@ def main():
         threads.append(threading.Thread(target=ffmpeg_error_reader, args=(process, stop_event), daemon=True))
         threads.append(threading.Thread(
             target=audio_reader,
-            args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, args.debug_audio),
+            args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, "", args.debug_audio),
             daemon=True,
         ))
 
@@ -491,7 +522,7 @@ def main():
     try:
         while not stop_event.is_set():
             time.sleep(0.5)
-            if not args.loopback and process.poll() is not None:
+            if process and process.poll() is not None:
                 print("[ERROR] FFmpeg process exited unexpectedly.")
                 stop_event.set()
                 break
@@ -499,7 +530,7 @@ def main():
         print("\n[INFO] Stopping...")
         stop_event.set()
     finally:
-        if not args.loopback:
+        if process:
             try:
                 process.terminate()
                 process.wait(timeout=5)
