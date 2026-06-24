@@ -1,8 +1,16 @@
 faster-whisper==1.1.1
-numpy>=1.24,<3
-pyaudiowpatch>=0.2.12
+numpy==2.4.6
+pyaudiowpatch==0.2.12.8
+soundfile==0.14.0
 
-# GPU support (CUDA 12.x wheels work on CUDA 13.x drivers via backward compatibility)
-# Install separately — pip cannot resolve the custom index automatically:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-torch>=2.0
+# Speaker diarization (optional — only needed with --diarize)
+# Pinned to 3.x — version 4+ requires torch>=2.8.0
+# Note: pyannote 3.x uses deprecated use_auth_token internally; a shim in main.py
+# translates it to token= for compatibility with huggingface_hub 0.25+
+pyannote.audio==3.4.0
+
+# GPU support — torch and torchaudio MUST be the same version and installed
+# from the same CUDA index to avoid DLL mismatches on Windows:
+#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchaudio==2.5.1

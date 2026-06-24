@@ -1,3 +1,4 @@
 .env
-transcript.txt
 .venv/
+*.txt
+!requirements.txt
