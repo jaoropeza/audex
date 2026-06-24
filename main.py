@@ -72,6 +72,20 @@ OUTPUT_PREFIX = "transcript"
 SILENCE_DB_THRESHOLD = -70.0
 SILENCE_WARN_CHUNKS = 10
 
+# Float32 RMS floor inside the transcriber (second gate after the audio reader).
+# Background noise (AC hum, typing) typically sits between -70 dB and -45 dB.
+# Whisper hallucinates "Gracias", "Thanks for watching", etc. on near-silence chunks.
+# 0.003 ≈ -50 dB on normalised float32 audio — well below quiet speech (~-30 dB).
+TRANSCRIBE_RMS_MIN = 0.003
+
+# faster-whisper hallucination filters (applied to every transcribe() call)
+WHISPER_NO_SPEECH_THRESHOLD = 0.6      # discard if Whisper's own VAD says < 40 % speech
+WHISPER_LOG_PROB_THRESHOLD   = -1.0    # discard very low-confidence segments
+WHISPER_COMPRESSION_RATIO    = 2.4     # discard repetitive / looping output
+
+# Suppress identical output repeated N times in a row
+REPEAT_SUPPRESS_N = 2
+
 
 # =========================
 # Speaker tracking
@@ -254,33 +268,42 @@ def _rms_db(raw: bytes) -> float:
 
 
 def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, label="", debug=False):
+    # Read in small pieces and accumulate so that pipe partial-reads on Windows
+    # (bufsize=0 may return <chunk_bytes per call) don't produce tiny chunks.
+    READ_SIZE = 4096
+    buf = b""
     previous_overlap = b""
     chunk_count = 0
     silent_streak = 0
 
     while not stop_event.is_set():
-        raw_chunk = process.stdout.read(chunk_bytes)
-        if not raw_chunk:
+        data = process.stdout.read(READ_SIZE)
+        if not data:
             print("[WARN] FFmpeg stopped sending audio.")
             break
+        buf += data
 
-        chunk_count += 1
-        db = _rms_db(raw_chunk)
+        while len(buf) >= chunk_bytes:
+            raw_chunk = buf[:chunk_bytes]
+            buf = buf[chunk_bytes:]
 
-        if db < SILENCE_DB_THRESHOLD:
-            silent_streak += 1
-            if silent_streak == SILENCE_WARN_CHUNKS:
-                print(f"[WARN] Audio silent for {SILENCE_WARN_CHUNKS} chunks. Is the microphone active?")
-        else:
-            silent_streak = 0
+            chunk_count += 1
+            db = _rms_db(raw_chunk)
 
-        if debug:
-            bar = "#" * int(max(0, (db + 60) / 2))
-            tag = f"{label} " if label else ""
-            print(f"[AUDIO {tag}chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|]")
+            if db < SILENCE_DB_THRESHOLD:
+                silent_streak += 1
+                if silent_streak == SILENCE_WARN_CHUNKS:
+                    print(f"[WARN] Audio silent for {SILENCE_WARN_CHUNKS} chunks. Is the microphone active?")
+            else:
+                silent_streak = 0
 
-        audio_queue.put((label, previous_overlap + raw_chunk))
-        previous_overlap = raw_chunk[-overlap_bytes:] if len(raw_chunk) >= overlap_bytes else raw_chunk
+            if debug:
+                bar = "#" * int(max(0, (db + 60) / 2))
+                tag = f"{label} " if label else ""
+                print(f"[AUDIO {tag}chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|]")
+
+            audio_queue.put((label, previous_overlap + raw_chunk))
+            previous_overlap = raw_chunk[-overlap_bytes:] if len(raw_chunk) >= overlap_bytes else raw_chunk
 
     stop_event.set()
 
@@ -496,10 +519,61 @@ def _format_line(ts: str, label: str, speaker: str, text: str) -> str:
     return "".join(parts)
 
 
+_GHOST_PHRASES = {
+    # Spanish
+    "gracias", "gracias por ver el video", "gracias por ver",
+    "gracias por su atención", "chau", "adios", "adiós",
+    "hasta luego", "hasta pronto", "suscríbete", "suscribete",
+    "subtítulos en español", "subtítulos realizados por",
+    # English
+    "thanks for watching", "thank you for watching", "thank you",
+    "thanks", "bye", "goodbye", "see you next time",
+    "please subscribe", "like and subscribe", "subtitles by",
+}
+
+
+def _clean_text(text: str) -> str:
+    """Lowercase + strip punctuation for comparison."""
+    return re.sub(r"[^\w\s]", "", text, flags=re.UNICODE).strip().lower()
+
+
+def _is_hallucination(text: str, recent: "collections.deque") -> bool:
+    """Return True if text is blank, a known ghost phrase, or repeated >= N times."""
+    if not text:
+        return True
+    clean = _clean_text(text)
+    if not clean:
+        return True
+    if clean in _GHOST_PHRASES:
+        return True
+    if sum(1 for r in recent if r == clean) >= REPEAT_SUPPRESS_N:
+        return True
+    return False
+
+
+def _strip_prefix_overlap(new_text: str, last_words: list) -> str:
+    """Remove words from the start of new_text that already appeared at the
+    end of last_words (overlap deduplication)."""
+    if not new_text or not last_words:
+        return new_text
+    new_words = new_text.split()
+    norm_new = [_clean_text(w) for w in new_words]
+    norm_last = [_clean_text(w) for w in last_words]
+    check = min(12, len(norm_last), len(norm_new))
+    for n in range(check, 0, -1):
+        if norm_last[-n:] == norm_new[:n]:
+            return " ".join(new_words[n:]).strip()
+    return new_text
+
+
 def transcriber(audio_queue, stop_event, model_size, device, compute_type, language, output_file):
+    import collections
     print(f"[INFO] Loading Whisper model '{model_size}' on {device}/{compute_type}...")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
     print("[INFO] Model loaded. Listening... (Ctrl+C to stop)\n")
+
+    recent_texts: collections.deque = collections.deque(maxlen=REPEAT_SUPPRESS_N + 1)
+    last_output_words: list = []
 
     while not stop_event.is_set():
         try:
@@ -511,6 +585,10 @@ def transcriber(audio_queue, stop_event, model_size, device, compute_type, langu
         if audio is None:
             continue
 
+        # Pre-Whisper silence gate on float32 audio
+        if float(np.sqrt(np.mean(audio ** 2))) < TRANSCRIBE_RMS_MIN:
+            continue
+
         try:
             segments, _ = model.transcribe(
                 audio,
@@ -519,13 +597,22 @@ def transcriber(audio_queue, stop_event, model_size, device, compute_type, langu
                 vad_filter=True,
                 condition_on_previous_text=False,
                 without_timestamps=True,
+                no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                compression_ratio_threshold=WHISPER_COMPRESSION_RATIO,
             )
             text = " ".join(s.text.strip() for s in segments if s.text.strip())
-            if text:
-                ts = datetime.now().strftime("%H:%M:%S")
-                line = _format_line(ts, label, "", text)
-                print(line)
-                append_transcript(line, output_file)
+            text = _strip_prefix_overlap(text, last_output_words)
+            clean = _clean_text(text)
+            if _is_hallucination(text, recent_texts):
+                recent_texts.append(clean)
+                continue
+            recent_texts.append(clean)
+            last_output_words = (last_output_words + text.split())[-20:]
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = _format_line(ts, label, "", text)
+            print(line)
+            append_transcript(line, output_file)
         except Exception as e:
             print(f"[ERROR] Transcription failed: {e}")
 
@@ -537,6 +624,7 @@ def transcriber(audio_queue, stop_event, model_size, device, compute_type, langu
 def transcriber_with_diarization(audio_queue, stop_event, model_size, device, compute_type,
                                   language, output_file, diarization_pipeline,
                                   embedding_model, speaker_tracker, num_speakers=None):
+    import collections
     import torch
 
     print(f"[INFO] Loading Whisper model '{model_size}' on {device}/{compute_type}...")
@@ -544,6 +632,8 @@ def transcriber_with_diarization(audio_queue, stop_event, model_size, device, co
     print("[INFO] Models ready. Listening with diarization... (Ctrl+C to stop)\n")
 
     MIN_TURN_SECONDS = 0.5
+    recent_texts: collections.deque = collections.deque(maxlen=REPEAT_SUPPRESS_N + 1)
+    last_output_words: list = []
 
     while not stop_event.is_set():
         try:
@@ -555,6 +645,10 @@ def transcriber_with_diarization(audio_queue, stop_event, model_size, device, co
         if audio is None:
             continue
 
+        # Pre-Whisper silence gate on float32 audio
+        if float(np.sqrt(np.mean(audio ** 2))) < TRANSCRIBE_RMS_MIN:
+            continue
+
         try:
             # 1. Transcribe with word-level timestamps
             segments, _ = model.transcribe(
@@ -564,6 +658,9 @@ def transcriber_with_diarization(audio_queue, stop_event, model_size, device, co
                 vad_filter=True,
                 condition_on_previous_text=False,
                 word_timestamps=True,
+                no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                compression_ratio_threshold=WHISPER_COMPRESSION_RATIO,
             )
             segments = list(segments)
             if not segments:
@@ -600,12 +697,18 @@ def transcriber_with_diarization(audio_queue, stop_event, model_size, device, co
             current_words = []
 
             def flush(spk, words):
-                text = " ".join(words).strip()
-                if text:
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    line = _format_line(ts, label, spk, text)
-                    print(line)
-                    append_transcript(line, output_file)
+                nonlocal last_output_words
+                text = _strip_prefix_overlap(" ".join(words).strip(), last_output_words)
+                clean = _clean_text(text)
+                if _is_hallucination(text, recent_texts):
+                    recent_texts.append(clean)
+                    return
+                recent_texts.append(clean)
+                last_output_words = (last_output_words + text.split())[-20:]
+                ts = datetime.now().strftime("%H:%M:%S")
+                line = _format_line(ts, label, spk, text)
+                print(line)
+                append_transcript(line, output_file)
 
             for seg in segments:
                 words = seg.words if seg.words else []
