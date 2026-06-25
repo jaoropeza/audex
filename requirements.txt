@@ -2,6 +2,7 @@ faster-whisper==1.1.1
 numpy==2.4.6
 pyaudiowpatch==0.2.12.8
 soundfile==0.14.0
+anthropic>=0.40.0
 
 # Speaker diarization (optional — only needed with --diarize)
 # Pinned to 3.x — version 4+ requires torch>=2.8.0

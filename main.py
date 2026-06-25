@@ -88,6 +88,37 @@ REPEAT_SUPPRESS_N = 2
 
 
 # =========================
+# Audio saver
+# =========================
+
+class AudioSaver:
+    """Thread-safe accumulator that writes all captured PCM to a WAV file on save()."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+
+    def write(self, pcm_bytes: bytes):
+        with self._lock:
+            self._buf.extend(pcm_bytes)
+
+    def save(self):
+        import wave
+        if not self._buf:
+            print("[INFO] No audio recorded — skipping audio file.")
+            return
+        with wave.open(self.path, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(BYTES_PER_SAMPLE)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(bytes(self._buf))
+        size_mb = len(self._buf) / (1024 * 1024)
+        duration_s = len(self._buf) / (SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS)
+        print(f"[INFO] Audio saved to: {self.path} ({duration_s:.0f}s, {size_mb:.1f} MB)")
+
+
+# =========================
 # Speaker tracking
 # =========================
 
@@ -267,7 +298,8 @@ def _rms_db(raw: bytes) -> float:
     return 20 * np.log10(rms / 32768.0 + 1e-9)
 
 
-def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, label="", debug=False):
+def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes,
+                 label="", debug=False, audio_saver=None):
     # Read in small pieces and accumulate so that pipe partial-reads on Windows
     # (bufsize=0 may return <chunk_bytes per call) don't produce tiny chunks.
     READ_SIZE = 4096
@@ -303,6 +335,8 @@ def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, l
                 print(f"[AUDIO {tag}chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|]")
 
             audio_queue.put((label, previous_overlap + raw_chunk))
+            if audio_saver:
+                audio_saver.write(raw_chunk)
             previous_overlap = raw_chunk[-overlap_bytes:] if len(raw_chunk) >= overlap_bytes else raw_chunk
 
     stop_event.set()
@@ -313,7 +347,7 @@ def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, l
 # =========================
 
 def loopback_reader(audio_queue, stop_event, device_name=None, chunk_seconds=DEFAULT_CHUNK_SECONDS,
-                    overlap_seconds=DEFAULT_OVERLAP_SECONDS, label="", debug=False):
+                    overlap_seconds=DEFAULT_OVERLAP_SECONDS, label="", debug=False, audio_saver=None):
     try:
         import pyaudiowpatch as pyaudio
     except ImportError:
@@ -390,6 +424,8 @@ def loopback_reader(audio_queue, stop_event, device_name=None, chunk_seconds=DEF
                 print(f"[AUDIO {tag}chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|]")
 
             audio_queue.put((label, previous_overlap + chunk))
+            if audio_saver:
+                audio_saver.write(chunk)
             previous_overlap = chunk[-overlap_bytes:] if len(chunk) >= overlap_bytes else chunk
 
         return (None, pyaudio.paContinue)
@@ -734,6 +770,89 @@ def transcriber_with_diarization(audio_queue, stop_event, model_size, device, co
 
 
 # =========================
+# Summarization
+# =========================
+
+def summarize_transcript(transcript_path: str, api_key: str = None):
+    try:
+        import anthropic
+    except ImportError:
+        print("[ERROR] Summarization requires: pip install anthropic")
+        return
+
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        print("[ERROR] --summarize requires ANTHROPIC_API_KEY env var or --api-key.")
+        return
+
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            transcript = f.read().strip()
+    except FileNotFoundError:
+        print(f"[WARN] Transcript file not found: {transcript_path}")
+        return
+
+    if not transcript:
+        print("[INFO] Transcript is empty — skipping summary.")
+        return
+    if len(transcript.splitlines()) < 3:
+        print("[INFO] Transcript too short for a meaningful summary.")
+        return
+
+    print("[INFO] Generating meeting summary...", flush=True)
+
+    prompt = f"""You are a professional meeting assistant. \
+Analyze the following conversation transcript and produce a structured summary \
+in the SAME language as the transcript.
+
+TRANSCRIPT:
+{transcript}
+
+Write the summary using these sections exactly:
+
+## Overview
+2–3 sentences describing what was discussed.
+
+## Key Decisions & Agreements
+Bullet list of decisions or agreements reached. Write "None identified" if none.
+
+## Action Items
+Bullet list of concrete tasks, with the responsible person when mentioned. \
+Write "None identified" if none.
+
+## Next Steps
+What should happen after this conversation ends. Write "None identified" if none.
+
+## Notable Points
+Any other important facts, context, risks, or follow-up items worth remembering."""
+
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        summary = response.content[0].text
+
+        summary_path = transcript_path.replace(".txt", "_summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(f"Transcript Summary\n")
+            f.write(f"Source : {transcript_path}\n")
+            f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(summary + "\n")
+
+        sep = "=" * 60
+        print(f"\n{sep}\n  MEETING SUMMARY\n{sep}")
+        print(summary)
+        print(sep)
+        print(f"[INFO] Summary saved to: {summary_path}")
+    except Exception as e:
+        print(f"[ERROR] Summarization failed: {e}")
+
+
+# =========================
 # Entry point
 # =========================
 
@@ -788,6 +907,20 @@ def parse_args():
                         help="Force CPU even if a GPU is available")
     parser.add_argument("--debug-audio", action="store_true",
                         help="Print RMS level of each audio chunk")
+
+    # Audio saving
+    parser.add_argument("--save-audio", nargs="?", const="audio", metavar="PREFIX",
+                        help="Save captured audio to a WAV file. "
+                             "Optional prefix (default: 'audio'). "
+                             "Timestamp is appended: audio_20260612_175830.wav")
+
+    # Summarization
+    parser.add_argument("--summarize", action="store_true",
+                        help="Generate a structured meeting summary when recording stops "
+                             "(requires ANTHROPIC_API_KEY env var or --api-key)")
+    parser.add_argument("--api-key", type=str, default=None, metavar="KEY",
+                        help="Anthropic API key for --summarize "
+                             "(default: ANTHROPIC_API_KEY env var)")
     return parser.parse_args()
 
 
@@ -823,6 +956,14 @@ def main():
     args.output = _make_output_path(args.output)
     print(f"[INFO] Transcript will be saved to: {args.output}")
 
+    # Audio saver setup
+    audio_saver = None
+    if args.save_audio is not None:
+        prefix = args.save_audio  # either the given prefix or "audio" (const)
+        audio_path = _make_output_path(prefix).replace(".txt", ".wav")
+        audio_saver = AudioSaver(audio_path)
+        print(f"[INFO] Audio will be saved to: {audio_path}")
+
     # GPU/CPU
     if args.cpu:
         whisper_device, compute_type = "cpu", "int8"
@@ -846,17 +987,20 @@ def main():
         threads.append(threading.Thread(target=ffmpeg_error_reader, args=(process, stop_event), daemon=True))
         threads.append(threading.Thread(
             target=audio_reader,
+            kwargs=dict(audio_saver=audio_saver),
             args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, "MIC", args.debug_audio),
             daemon=True,
         ))
         threads.append(threading.Thread(
             target=loopback_reader,
+            kwargs=dict(audio_saver=audio_saver),
             args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, "SPK", args.debug_audio),
             daemon=True,
         ))
     elif args.loopback:
         threads.append(threading.Thread(
             target=loopback_reader,
+            kwargs=dict(audio_saver=audio_saver),
             args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, "", args.debug_audio),
             daemon=True,
         ))
@@ -865,6 +1009,7 @@ def main():
         threads.append(threading.Thread(target=ffmpeg_error_reader, args=(process, stop_event), daemon=True))
         threads.append(threading.Thread(
             target=audio_reader,
+            kwargs=dict(audio_saver=audio_saver),
             args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, "", args.debug_audio),
             daemon=True,
         ))
@@ -923,6 +1068,10 @@ def main():
             except Exception:
                 process.kill()
         print(f"[INFO] Done. Transcript saved to: {args.output}")
+        if audio_saver:
+            audio_saver.save()
+        if args.summarize:
+            summarize_transcript(args.output, api_key=args.api_key)
 
 
 if __name__ == "__main__":
