@@ -1,8 +1,13 @@
-import os
+from __future__ import annotations
+
 import re
 import traceback
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, field_validator
+
+from application.config_service import ConfigService
+from application.translation_service import TranslationService
 
 router = APIRouter()
 
@@ -26,13 +31,7 @@ class TranslateRequest(BaseModel):
 
 @router.post("/translate")
 async def translate_lines(req: TranslateRequest):
-    import anthropic  # lazy import — keeps server startup fast
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
-
-    # Split prefix ([HH:MM:SS][LABEL]) from spoken text
+    # Split [HH:MM:SS][LABEL] prefix from spoken text (API-layer concern)
     prefixes, contents = [], []
     for line in req.lines:
         m = _PREFIX_RE.match(line)
@@ -43,45 +42,18 @@ async def translate_lines(req: TranslateRequest):
             prefixes.append("")
             contents.append(line)
 
-    numbered = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(contents))
+    cfg = ConfigService().get()
+    service = TranslationService(cfg.translation)
 
-    prompt = (
-        f"Translate the following numbered transcript lines into {req.target_language}.\n"
-        "Rules:\n"
-        "- Return ONLY the numbered lines in the same format: \"1. translated text\"\n"
-        "- Do NOT translate proper nouns, product names, or technical terms.\n"
-        "- Preserve natural spoken-word flow; these are transcribed speech lines.\n"
-        "- If a line is already in the target language, copy it unchanged.\n\n"
-        f"{numbered}"
-    )
-
-    client = anthropic.Anthropic(api_key=api_key)
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        translated = await service.translate(contents, req.target_language)
     except Exception as exc:
         traceback.print_exc()
-        raise HTTPException(status_code=502, detail=f"Claude API error: {exc}")
-
-    raw_lines = response.content[0].text.strip().splitlines()
-
-    translated: list[str] = []
-    for i, raw in enumerate(raw_lines):
-        m = re.match(r"^\d+\.\s+(.*)", raw.strip())
-        translated.append(m.group(1) if m else (contents[i] if i < len(contents) else ""))
-
-    # Pad / trim to input length
-    while len(translated) < len(req.lines):
-        translated.append(contents[len(translated)] if len(translated) < len(contents) else "")
-    translated = translated[: len(req.lines)]
+        raise HTTPException(status_code=502, detail=f"Translation error: {exc}")
 
     # Re-attach original prefixes
     result = [
         f"{p} {t}".strip() if p else t
         for p, t in zip(prefixes, translated)
     ]
-
     return {"translations": result}

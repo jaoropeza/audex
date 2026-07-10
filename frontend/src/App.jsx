@@ -3,10 +3,11 @@ import TranscriptList from "./components/TranscriptList";
 import TranscriptViewer from "./components/TranscriptViewer";
 import LiveViewer from "./components/LiveViewer";
 import RecordingPanel from "./components/RecordingPanel";
+import ModelConfig from "./components/ModelConfig";
 import { useRecording } from "./hooks/useRecording";
 import styles from "./styles/App.module.css";
 
-const TABS = ["Viewer", "Live", "Recording"];
+const TABS = ["Viewer", "Live", "Recording", "Settings"];
 
 function getInitialTheme() {
   const stored = localStorage.getItem("theme");
@@ -98,6 +99,9 @@ export default function App() {
         )}
         {activeTab === "Recording" && (
           <RecordingPanel recording={recording} onStart={handleStart} onStop={handleStop} />
+        )}
+        {activeTab === "Settings" && (
+          <ModelConfig />
         )}
       </main>
     </div>

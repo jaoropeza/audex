@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from api import transcripts, stream, recording, translate
+from api import transcripts, stream, recording, translate, config as config_api
 
 app = FastAPI(title="STT Web UI", version="1.0.0")
 
@@ -22,10 +22,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(transcripts.router, prefix="/api/transcripts", tags=["transcripts"])
-app.include_router(stream.router,      prefix="/api/stream",       tags=["stream"])
-app.include_router(recording.router,   prefix="/api/recording",    tags=["recording"])
-app.include_router(translate.router,   prefix="/api",              tags=["translate"])
+app.include_router(transcripts.router,  prefix="/api/transcripts", tags=["transcripts"])
+app.include_router(stream.router,       prefix="/api/stream",       tags=["stream"])
+app.include_router(recording.router,    prefix="/api/recording",    tags=["recording"])
+app.include_router(translate.router,    prefix="/api",              tags=["translate"])
+app.include_router(config_api.router,   prefix="/api",              tags=["config"])
 
 # Serve React build. Must be registered AFTER API routes.
 _static = Path(__file__).parent / "frontend" / "dist"

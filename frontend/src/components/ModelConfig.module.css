@@ -1,0 +1,226 @@
+.container {
+  padding: 1.5rem;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 1.5rem;
+  color: var(--text-primary, #1a1a1a);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 680px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.card {
+  background: var(--surface, #ffffff);
+  border: 1px solid var(--border, #e2e2e2);
+  border-radius: 10px;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+:root[data-theme="dark"] .card {
+  background: var(--surface, #1e1e1e);
+  border-color: var(--border, #3a3a3a);
+}
+
+.cardTitle {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0 0 0.25rem 0;
+  color: var(--text-primary, #1a1a1a);
+}
+
+:root[data-theme="dark"] .cardTitle {
+  color: var(--text-primary, #f0f0f0);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.label {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-secondary, #555);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+:root[data-theme="dark"] .label {
+  color: var(--text-secondary, #aaa);
+}
+
+.select,
+.input {
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 6px;
+  font-size: 0.875rem;
+  background: var(--input-bg, #fafafa);
+  color: var(--text-primary, #1a1a1a);
+  width: 100%;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+}
+
+.select:focus,
+.input:focus {
+  outline: none;
+  border-color: var(--accent, #5865f2);
+}
+
+:root[data-theme="dark"] .select,
+:root[data-theme="dark"] .input {
+  background: var(--input-bg, #2a2a2a);
+  border-color: var(--border, #3a3a3a);
+  color: var(--text-primary, #f0f0f0);
+}
+
+.testRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.25rem;
+}
+
+.testBtn {
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--accent, #5865f2);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #5865f2);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+.testBtn:hover:not(:disabled) {
+  background: var(--accent, #5865f2);
+  color: #fff;
+}
+
+.testBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.testResult {
+  font-size: 0.78rem;
+  padding: 0.3rem 0.6rem;
+  border-radius: 5px;
+  flex: 1;
+}
+
+.testOk {
+  background: rgba(34, 197, 94, 0.12);
+  color: #16a34a;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+:root[data-theme="dark"] .testOk {
+  color: #4ade80;
+}
+
+.testFail {
+  background: rgba(239, 68, 68, 0.12);
+  color: #dc2626;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+:root[data-theme="dark"] .testFail {
+  color: #f87171;
+}
+
+.actions {
+  margin-top: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.saveBtn {
+  padding: 0.55rem 1.5rem;
+  border: none;
+  border-radius: 7px;
+  background: var(--accent, #5865f2);
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.saveBtn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.saveBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.resetBtn {
+  padding: 0.55rem 1rem;
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary, #666);
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.resetBtn:hover:not(:disabled) {
+  border-color: var(--text-secondary, #888);
+  color: var(--text-primary, #1a1a1a);
+}
+
+:root[data-theme="dark"] .resetBtn:hover:not(:disabled) {
+  color: var(--text-primary, #f0f0f0);
+}
+
+.saveStatus {
+  font-size: 0.82rem;
+}
+
+.saveOk {
+  color: #16a34a;
+}
+
+:root[data-theme="dark"] .saveOk {
+  color: #4ade80;
+}
+
+.saveErr {
+  color: #dc2626;
+}
+
+:root[data-theme="dark"] .saveErr {
+  color: #f87171;
+}
+
+.loading {
+  color: var(--text-secondary, #888);
+  font-size: 0.9rem;
+  padding: 2rem;
+  text-align: center;
+}

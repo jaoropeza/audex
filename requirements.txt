@@ -9,6 +9,11 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 
+# Multi-provider adapters
+openai>=1.50.0
+google-generativeai>=0.8.0
+httpx>=0.27.0
+
 # Speaker diarization (optional — only needed with --diarize)
 # Pinned to 3.x — version 4+ requires torch>=2.8.0
 # Note: pyannote 3.x uses deprecated use_auth_token internally; a shim in main.py

@@ -87,8 +87,8 @@ class StartRequest(BaseModel):
     mode: str                           # "mic" | "loopback" | "merge"
     device: Optional[str] = None        # loopback device hint, or mic device
     mic: Optional[str] = None           # merge mode mic
-    model: str = "small"
-    language: str = "en"
+    model: Optional[str] = None         # None → use saved STT config default
+    language: Optional[str] = None      # None → use saved STT config default
     diarize: bool = False
     hf_token: Optional[str] = None
     num_speakers: Optional[int] = None
@@ -123,7 +123,11 @@ async def start_recording(req: StartRequest):
     else:
         raise HTTPException(status_code=422, detail=f"Unknown mode: {req.mode}")
 
-    cmd += ["--model", req.model, "--language", req.language]
+    from application.config_service import ConfigService
+    stt_cfg = ConfigService().get().stt
+    model    = req.model    or stt_cfg.model    or "small"
+    language = req.language or stt_cfg.language or "en"
+    cmd += ["--model", model, "--language", language]
     cmd += ["--output", req.output_prefix]
 
     if req.diarize:

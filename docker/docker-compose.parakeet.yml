@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  parakeet-nemo:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nemo
+    image: stt-parakeet-nemo:latest
+    runtime: nvidia          # requires NVIDIA Container Toolkit
+    environment:
+      MODEL_NAME: nvidia/parakeet-tdt-0.6b-v3
+      PORT: "5001"
+      NVIDIA_VISIBLE_DEVICES: all
+    ports:
+      - "5001:5001"
+    volumes:
+      - parakeet-models:/root/.cache   # cache downloaded model weights
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s    # model download can take a few minutes
+
+volumes:
+  parakeet-models:

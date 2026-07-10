@@ -3,6 +3,7 @@
 *.txt
 !requirements.txt
 *.wav
+config/settings.json
 # Logs
 logs
 *.log

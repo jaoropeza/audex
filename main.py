@@ -1,19 +1,17 @@
 import os
-import subprocess
 import queue
-import threading
-import time
 import sys
 import re
 import argparse
+import threading
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
 
-# Suppress torch.load pickle warning — models loaded from HuggingFace Hub are trusted
+# ── Warning / logging suppression (unchanged) ─────────────────────────────────
 warnings.filterwarnings("ignore", message=".*weights_only.*", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*pkg_resources.*", category=DeprecationWarning)
-# Suppress pytorch_lightning / pyannote version-mismatch and checkpoint-upgrade chatter
 warnings.filterwarnings("ignore", message=".*ModelCheckpoint.*callback states.*")
 warnings.filterwarnings("ignore", message=".*Found keys that are not in the model state dict.*")
 warnings.filterwarnings("ignore", message=".*Model was trained with.*")
@@ -26,11 +24,10 @@ _logging.getLogger("lightning_fabric").setLevel(_logging.ERROR)
 _logging.getLogger("lightning").setLevel(_logging.ERROR)
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-# Prefer torch's own bundled cuDNN over any system-installed version to avoid DLL symbol conflicts
 os.environ.setdefault("TORCH_CUDNN_V8_API_DISABLED", "0")
 
-# Compatibility shim: pyannote.audio 3.x calls hf_hub_download(use_auth_token=...)
-# which was removed in huggingface_hub 0.25+. Patch it to translate to token=...
+
+# Compatibility shim: pyannote.audio 3.x uses removed use_auth_token kwarg
 def _patch_huggingface_hub():
     try:
         import huggingface_hub
@@ -51,53 +48,27 @@ def _patch_huggingface_hub():
 _patch_huggingface_hub()
 
 import numpy as np
-from faster_whisper import WhisperModel
 
-
-# =========================
-# Defaults
-# =========================
-
-FFMPEG_PATH = "ffmpeg"
-SAMPLE_RATE = 16000
-CHANNELS = 1
+# ── Constants ─────────────────────────────────────────────────────────────────
+SAMPLE_RATE      = 16000
+CHANNELS         = 1
 BYTES_PER_SAMPLE = 2
-
-DEFAULT_MODEL = "small"
+DEFAULT_MODEL    = "small"
 DEFAULT_LANGUAGE = "en"
-DEFAULT_CHUNK_SECONDS = 5
+DEFAULT_CHUNK_SECONDS   = 5
 DEFAULT_OVERLAP_SECONDS = 1
-OUTPUT_PREFIX = "transcript"
-
-SILENCE_DB_THRESHOLD = -70.0
-SILENCE_WARN_CHUNKS = 10
-
-# Float32 RMS floor inside the transcriber (second gate after the audio reader).
-# Background noise (AC hum, typing) typically sits between -70 dB and -45 dB.
-# Whisper hallucinates "Gracias", "Thanks for watching", etc. on near-silence chunks.
-# 0.003 ≈ -50 dB on normalised float32 audio — well below quiet speech (~-30 dB).
-TRANSCRIBE_RMS_MIN = 0.003
-
-# faster-whisper hallucination filters (applied to every transcribe() call)
-WHISPER_NO_SPEECH_THRESHOLD = 0.6      # discard if Whisper's own VAD says < 40 % speech
-WHISPER_LOG_PROB_THRESHOLD   = -1.0    # discard very low-confidence segments
-WHISPER_COMPRESSION_RATIO    = 2.4     # discard repetitive / looping output
-
-# Suppress identical output repeated N times in a row
-REPEAT_SUPPRESS_N = 2
+OUTPUT_PREFIX    = "transcript"
 
 
-# =========================
-# Audio saver
-# =========================
+# ── AudioSaver ────────────────────────────────────────────────────────────────
 
 class AudioSaver:
-    """Thread-safe accumulator that writes all captured PCM to a WAV file on save()."""
+    """Thread-safe PCM accumulator; writes WAV on save()."""
 
     def __init__(self, path: str):
-        self.path = path
+        self.path  = path
         self._lock = threading.Lock()
-        self._buf = bytearray()
+        self._buf  = bytearray()
 
     def write(self, pcm_bytes: bytes):
         with self._lock:
@@ -113,27 +84,19 @@ class AudioSaver:
             wf.setsampwidth(BYTES_PER_SAMPLE)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(bytes(self._buf))
-        size_mb = len(self._buf) / (1024 * 1024)
+        size_mb    = len(self._buf) / (1024 * 1024)
         duration_s = len(self._buf) / (SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS)
         print(f"[INFO] Audio saved to: {self.path} ({duration_s:.0f}s, {size_mb:.1f} MB)")
 
 
-# =========================
-# Speaker tracking
-# =========================
+# ── SpeakerTracker ────────────────────────────────────────────────────────────
 
 class SpeakerTracker:
-    """
-    Matches speaker embeddings across audio chunks.
-    Named profiles (loaded from .wav files) are fixed references.
-    Auto-discovered speakers get IDs like SPEAKER_00, SPEAKER_01, …
-    """
-
     def __init__(self, similarity_threshold=0.75):
-        self.profiles = {}        # name -> normalized embedding (np.ndarray)
-        self.named = set()        # names loaded from profiles (not updated)
+        self.profiles  = {}
+        self.named     = set()
         self.threshold = similarity_threshold
-        self._counter = 0
+        self._counter  = 0
 
     def add_named_profile(self, name: str, embedding: np.ndarray):
         self.profiles[name] = self._norm(embedding)
@@ -146,14 +109,11 @@ class SpeakerTracker:
             sim = float(np.dot(emb, ref))
             if sim > best_sim:
                 best_sim, best_name = sim, name
-
         if best_name and best_sim >= self.threshold:
-            # Update running mean only for auto-discovered speakers
             if best_name not in self.named:
                 updated = 0.9 * self.profiles[best_name] + 0.1 * emb
                 self.profiles[best_name] = self._norm(updated)
             return best_name
-
         name = f"SPEAKER_{self._counter:02d}"
         self._counter += 1
         self.profiles[name] = emb.copy()
@@ -165,24 +125,17 @@ class SpeakerTracker:
         return v / (n + 1e-9)
 
 
-# =========================
-# Audio device discovery
-# =========================
-
-def _ffmpeg_available():
-    try:
-        subprocess.run([FFMPEG_PATH, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except FileNotFoundError:
-        print("[ERROR] ffmpeg not found. Install it and add it to your PATH.")
-        return False
-
+# ── Device discovery ──────────────────────────────────────────────────────────
 
 def list_dshow_devices():
-    if not _ffmpeg_available():
+    import subprocess
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        print("[ERROR] ffmpeg not found.")
         return []
     result = subprocess.run(
-        [FFMPEG_PATH, "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+        ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     output = result.stderr.decode(errors="ignore")
@@ -209,9 +162,9 @@ def list_loopback_devices():
     try:
         import pyaudiowpatch as pyaudio
     except ImportError:
-        print("[ERROR] pyaudiowpatch not installed. Run: pip install pyaudiowpatch")
+        print("[ERROR] pyaudiowpatch not installed.")
         return []
-    p = pyaudio.PyAudio()
+    p       = pyaudio.PyAudio()
     devices = list(p.get_loopback_device_info_generator())
     p.terminate()
     return devices
@@ -222,7 +175,6 @@ def list_audio_devices():
     print("Usage: python main.py --device \"<name>\"\n")
     for d in list_dshow_devices():
         print(f'  "{d}"')
-
     print("\n--- Loopback devices (speakers) ---")
     print("Usage: python main.py --loopback [--device \"<partial name>\"]\n")
     loopback = list_loopback_devices()
@@ -234,223 +186,13 @@ def list_audio_devices():
     print()
 
 
-# =========================
-# CUDA detection
-# =========================
+# ── Diarization helpers ───────────────────────────────────────────────────────
 
-def detect_device():
-    try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            gpu_name = "unknown GPU"
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    gpu_name = torch.cuda.get_device_name(0)
-            except ImportError:
-                pass
-            print(f"[INFO] GPU detected: {gpu_name} — using CUDA/float16")
-            return "cuda", "float16"
-    except (ImportError, Exception):
-        pass
-    print("[INFO] No CUDA GPU detected — using CPU/int8")
-    return "cpu", "int8"
+def _emb_to_numpy(emb) -> np.ndarray:
+    if isinstance(emb, np.ndarray):
+        return emb.squeeze().astype(np.float32)
+    return emb.squeeze().cpu().numpy().astype(np.float32)
 
-
-# =========================
-# FFmpeg capture (microphone)
-# =========================
-
-def start_ffmpeg(audio_device, debug=False):
-    command = [
-        FFMPEG_PATH, "-hide_banner",
-        "-loglevel", "warning" if debug else "error",
-        "-f", "dshow",
-        "-i", f"audio={audio_device}",
-        "-ac", str(CHANNELS),
-        "-ar", str(SAMPLE_RATE),
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
-        "-f", "s16le", "-",
-    ]
-    print(f"[INFO] Starting microphone capture from: {audio_device}")
-    try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    except FileNotFoundError:
-        print("[ERROR] ffmpeg not found.")
-        sys.exit(1)
-    return process
-
-
-def ffmpeg_error_reader(process, stop_event):
-    while not stop_event.is_set():
-        line = process.stderr.readline()
-        if not line:
-            break
-        msg = line.decode(errors="ignore").strip()
-        if msg:
-            print(f"[FFMPEG] {msg}")
-
-
-def _rms_db(raw: bytes) -> float:
-    arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    rms = float(np.sqrt(np.mean(arr ** 2))) if arr.size else 0.0
-    return 20 * np.log10(rms / 32768.0 + 1e-9)
-
-
-def audio_reader(process, audio_queue, stop_event, chunk_bytes, overlap_bytes,
-                 label="", debug=False, audio_saver=None):
-    # Read in small pieces and accumulate so that pipe partial-reads on Windows
-    # (bufsize=0 may return <chunk_bytes per call) don't produce tiny chunks.
-    READ_SIZE = 4096
-    buf = b""
-    previous_overlap = b""
-    chunk_count = 0
-    silent_streak = 0
-
-    while not stop_event.is_set():
-        data = process.stdout.read(READ_SIZE)
-        if not data:
-            print("[WARN] FFmpeg stopped sending audio.")
-            break
-        buf += data
-
-        while len(buf) >= chunk_bytes:
-            raw_chunk = buf[:chunk_bytes]
-            buf = buf[chunk_bytes:]
-
-            chunk_count += 1
-            db = _rms_db(raw_chunk)
-
-            if db < SILENCE_DB_THRESHOLD:
-                silent_streak += 1
-                if silent_streak == SILENCE_WARN_CHUNKS:
-                    print(f"[WARN] Audio silent for {SILENCE_WARN_CHUNKS} chunks. Is the microphone active?")
-            else:
-                silent_streak = 0
-
-            if debug:
-                bar = "#" * int(max(0, (db + 60) / 2))
-                tag = f"{label} " if label else ""
-                print(f"[AUDIO {tag}chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|]")
-
-            audio_queue.put((label, previous_overlap + raw_chunk))
-            if audio_saver:
-                audio_saver.write(raw_chunk)
-            previous_overlap = raw_chunk[-overlap_bytes:] if len(raw_chunk) >= overlap_bytes else raw_chunk
-
-    stop_event.set()
-
-
-# =========================
-# WASAPI loopback capture (speakers)
-# =========================
-
-def loopback_reader(audio_queue, stop_event, device_name=None, chunk_seconds=DEFAULT_CHUNK_SECONDS,
-                    overlap_seconds=DEFAULT_OVERLAP_SECONDS, label="", debug=False, audio_saver=None):
-    try:
-        import pyaudiowpatch as pyaudio
-    except ImportError:
-        print("[ERROR] pyaudiowpatch not installed. Run: pip install pyaudiowpatch")
-        stop_event.set()
-        return
-
-    p = pyaudio.PyAudio()
-    target = None
-    for dev in p.get_loopback_device_info_generator():
-        if device_name is None or device_name.lower() in dev["name"].lower():
-            target = dev
-            break
-
-    if target is None:
-        try:
-            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-            default_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-            for dev in p.get_loopback_device_info_generator():
-                if default_out["name"] in dev["name"]:
-                    target = dev
-                    break
-        except Exception:
-            pass
-
-    if target is None:
-        print("[ERROR] No loopback device found. Run --list-devices.")
-        stop_event.set()
-        p.terminate()
-        return
-
-    native_rate = int(target["defaultSampleRate"])
-    native_channels = min(int(target["maxInputChannels"]), 2)
-    print(f"[INFO] Loopback capture from: {target['name']} @ {native_rate} Hz / {native_channels} ch")
-
-    target_chunk_bytes = int(SAMPLE_RATE * chunk_seconds) * BYTES_PER_SAMPLE
-    overlap_bytes = int(SAMPLE_RATE * overlap_seconds) * BYTES_PER_SAMPLE
-    frames_per_buffer = native_rate // 10
-
-    buf = b""
-    previous_overlap = b""
-    chunk_count = 0
-    silent_streak = 0
-
-    def callback(in_data, _fc, _ti, _st):
-        nonlocal buf, previous_overlap, chunk_count, silent_streak
-
-        arr = np.frombuffer(in_data, dtype=np.int16).astype(np.float32)
-        if native_channels == 2:
-            arr = arr.reshape(-1, 2).mean(axis=1)
-        if native_rate != SAMPLE_RATE:
-            target_len = int(len(arr) * SAMPLE_RATE / native_rate)
-            indices = np.linspace(0, len(arr) - 1, target_len)
-            arr = np.interp(indices, np.arange(len(arr)), arr)
-
-        buf += arr.clip(-32768, 32767).astype(np.int16).tobytes()
-
-        while len(buf) >= target_chunk_bytes:
-            chunk = buf[:target_chunk_bytes]
-            buf = buf[target_chunk_bytes:]
-            chunk_count += 1
-            db = _rms_db(chunk)
-
-            if db < SILENCE_DB_THRESHOLD:
-                silent_streak += 1
-                if silent_streak == SILENCE_WARN_CHUNKS:
-                    print(f"[WARN] Audio silent for {SILENCE_WARN_CHUNKS} chunks. Is audio playing?")
-            else:
-                silent_streak = 0
-
-            if debug:
-                bar = "#" * int(max(0, (db + 60) / 2))
-                tag = f"{label} " if label else ""
-                print(f"[AUDIO {tag}chunk={chunk_count:4d}  {db:6.1f} dB  |{bar:<30}|]")
-
-            audio_queue.put((label, previous_overlap + chunk))
-            if audio_saver:
-                audio_saver.write(chunk)
-            previous_overlap = chunk[-overlap_bytes:] if len(chunk) >= overlap_bytes else chunk
-
-        return (None, pyaudio.paContinue)
-
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=native_channels,
-        rate=native_rate,
-        frames_per_buffer=frames_per_buffer,
-        input=True,
-        input_device_index=target["index"],
-        stream_callback=callback,
-    )
-    stream.start_stream()
-    while not stop_event.is_set() and stream.is_active():
-        time.sleep(0.1)
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    stop_event.set()
-
-
-# =========================
-# Diarization helpers
-# =========================
 
 def load_diarization_models(hf_token: str, torch_device: str):
     from pyannote.audio import Pipeline, Inference
@@ -458,41 +200,22 @@ def load_diarization_models(hf_token: str, torch_device: str):
     import torch
 
     login(token=hf_token, add_to_git_credential=False)
-
-    # pyannote is loaded on CPU unconditionally.
-    # Pipeline.from_pretrained() internally auto-detects CUDA and initialises cuDNN,
-    # which causes a fatal cuDNN symbol error on some Windows setups even when
-    # torch.cuda.is_available() returns True (DLL conflict between bundled and system cuDNN).
-    # Faster-whisper (via CTranslate2) is unaffected and continues to run on the GPU.
-    # CPU diarization of 5-second chunks is fast enough for real-time use.
-    diarize_device = "cpu"
-
-    print("[INFO] Loading diarization pipeline on CPU (models cached locally)...", flush=True)
-    # Temporarily mask the GPU so pyannote never attempts CUDA initialisation
+    print("[INFO] Loading diarization pipeline on CPU…", flush=True)
     original = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
         pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-        pipeline.to(torch.device(diarize_device))
-        print("[INFO] Loading speaker embedding model...", flush=True)
+        pipeline.to(torch.device("cpu"))
+        print("[INFO] Loading speaker embedding model…", flush=True)
         embedding_model = Inference("pyannote/embedding", window="whole")
-        embedding_model.to(torch.device(diarize_device))
+        embedding_model.to(torch.device("cpu"))
     finally:
-        # Always restore GPU visibility for faster-whisper / ctranslate2
         if original is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = original
-
-    print(f"[INFO] Diarization models ready on {diarize_device} (faster-whisper uses {torch_device}).")
+    print(f"[INFO] Diarization models ready (faster-whisper uses {torch_device}).")
     return pipeline, embedding_model
-
-
-def _emb_to_numpy(emb) -> np.ndarray:
-    """Return embedding as a flat numpy float32 array regardless of source type."""
-    if isinstance(emb, np.ndarray):
-        return emb.squeeze().astype(np.float32)
-    return emb.squeeze().cpu().numpy().astype(np.float32)
 
 
 def load_speaker_profiles(profiles_dir: str, embedding_model, tracker: SpeakerTracker):
@@ -500,19 +223,17 @@ def load_speaker_profiles(profiles_dir: str, embedding_model, tracker: SpeakerTr
     try:
         import soundfile as sf
     except ImportError:
-        print("[WARN] soundfile not installed — skipping speaker profiles. pip install soundfile")
+        print("[WARN] soundfile not installed — skipping speaker profiles.")
         return
-
     for wav_path in sorted(Path(profiles_dir).glob("*.wav")):
-        name = wav_path.stem
+        name      = wav_path.stem
         audio, sr = sf.read(str(wav_path), dtype="float32")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         if sr != SAMPLE_RATE:
             target_len = int(len(audio) * SAMPLE_RATE / sr)
-            indices = np.linspace(0, len(audio) - 1, target_len)
-            audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
-
+            indices    = np.linspace(0, len(audio) - 1, target_len)
+            audio      = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
         waveform = torch.from_numpy(audio).unsqueeze(0).float()
         with torch.no_grad():
             emb = embedding_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
@@ -529,16 +250,7 @@ def _get_speaker_at(turns, start: float, end: float) -> str:
     return best_name
 
 
-# =========================
-# Transcription (plain)
-# =========================
-
-def pcm_to_float32(raw_audio: bytes):
-    arr = np.frombuffer(raw_audio, dtype=np.int16)
-    if arr.size == 0:
-        return None
-    return arr.astype(np.float32) / 32768.0
-
+# ── Transcript helpers ────────────────────────────────────────────────────────
 
 def append_transcript(line: str, output_file: str):
     with open(output_file, "a", encoding="utf-8") as f:
@@ -555,121 +267,49 @@ def _format_line(ts: str, label: str, speaker: str, text: str) -> str:
     return "".join(parts)
 
 
-_GHOST_PHRASES = {
-    # Spanish
-    "gracias", "gracias por ver el video", "gracias por ver",
-    "gracias por su atención", "chau", "adios", "adiós",
-    "hasta luego", "hasta pronto", "suscríbete", "suscribete",
-    "subtítulos en español", "subtítulos realizados por",
-    # English
-    "thanks for watching", "thank you for watching", "thank you",
-    "thanks", "bye", "goodbye", "see you next time",
-    "please subscribe", "like and subscribe", "subtitles by",
-}
+# ── Transcription loops ───────────────────────────────────────────────────────
 
-
-def _clean_text(text: str) -> str:
-    """Lowercase + strip punctuation for comparison."""
-    return re.sub(r"[^\w\s]", "", text, flags=re.UNICODE).strip().lower()
-
-
-def _is_hallucination(text: str, recent: "collections.deque") -> bool:
-    """Return True if text is blank, a known ghost phrase, or repeated >= N times."""
-    if not text:
-        return True
-    clean = _clean_text(text)
-    if not clean:
-        return True
-    if clean in _GHOST_PHRASES:
-        return True
-    if sum(1 for r in recent if r == clean) >= REPEAT_SUPPRESS_N:
-        return True
-    return False
-
-
-def _strip_prefix_overlap(new_text: str, last_words: list) -> str:
-    """Remove words from the start of new_text that already appeared at the
-    end of last_words (overlap deduplication)."""
-    if not new_text or not last_words:
-        return new_text
-    new_words = new_text.split()
-    norm_new = [_clean_text(w) for w in new_words]
-    norm_last = [_clean_text(w) for w in last_words]
-    check = min(12, len(norm_last), len(norm_new))
-    for n in range(check, 0, -1):
-        if norm_last[-n:] == norm_new[:n]:
-            return " ".join(new_words[n:]).strip()
-    return new_text
-
-
-def transcriber(audio_queue, stop_event, model_size, device, compute_type, language, output_file):
-    import collections
-    print(f"[INFO] Loading Whisper model '{model_size}' on {device}/{compute_type}...")
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    print("[INFO] Model loaded. Listening... (Ctrl+C to stop)\n")
-
-    recent_texts: collections.deque = collections.deque(maxlen=REPEAT_SUPPRESS_N + 1)
-    last_output_words: list = []
-
+def _plain_transcription_loop(stt_adapter, audio_queue, stop_event, language, output_file):
+    """Run in a daemon thread; delegates chunk processing to the STT adapter."""
     while not stop_event.is_set():
         try:
             label, raw_audio = audio_queue.get(timeout=1)
         except queue.Empty:
             continue
-
-        audio = pcm_to_float32(raw_audio)
-        if audio is None:
-            continue
-
-        # Pre-Whisper silence gate on float32 audio
-        if float(np.sqrt(np.mean(audio ** 2))) < TRANSCRIBE_RMS_MIN:
-            continue
-
-        try:
-            segments, _ = model.transcribe(
-                audio,
-                language=language if language != "auto" else None,
-                beam_size=1,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                without_timestamps=True,
-                no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-                compression_ratio_threshold=WHISPER_COMPRESSION_RATIO,
-            )
-            text = " ".join(s.text.strip() for s in segments if s.text.strip())
-            text = _strip_prefix_overlap(text, last_output_words)
-            clean = _clean_text(text)
-            if _is_hallucination(text, recent_texts):
-                recent_texts.append(clean)
-                continue
-            recent_texts.append(clean)
-            last_output_words = (last_output_words + text.split())[-20:]
-            ts = datetime.now().strftime("%H:%M:%S")
-            line = _format_line(ts, label, "", text)
+        line = stt_adapter.transcribe_chunk(label, raw_audio, language)
+        if line:
             print(line)
             append_transcript(line, output_file)
-        except Exception as e:
-            print(f"[ERROR] Transcription failed: {e}")
 
 
-# =========================
-# Transcription + diarization
-# =========================
-
-def transcriber_with_diarization(audio_queue, stop_event, model_size, device, compute_type,
-                                  language, output_file, diarization_pipeline,
-                                  embedding_model, speaker_tracker, num_speakers=None):
-    import collections
+def _diarized_transcription_loop(
+    stt_adapter, audio_queue, stop_event, language, output_file,
+    diarization_pipeline, embedding_model, speaker_tracker, num_speakers=None
+):
+    """Diarization loop: uses stt_adapter.transcribe_segments() + pyannote."""
+    import collections as _col
     import torch
-
-    print(f"[INFO] Loading Whisper model '{model_size}' on {device}/{compute_type}...")
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    print("[INFO] Models ready. Listening with diarization... (Ctrl+C to stop)\n")
+    from adapters.stt.faster_whisper_adapter import (
+        _clean_text, _is_hallucination, _strip_prefix_overlap,
+    )
 
     MIN_TURN_SECONDS = 0.5
-    recent_texts: collections.deque = collections.deque(maxlen=REPEAT_SUPPRESS_N + 1)
-    last_output_words: list = []
+    recent_texts     = _col.deque(maxlen=3)
+    last_words: list = []
+
+    def flush(spk, words, label):
+        nonlocal last_words
+        text  = _strip_prefix_overlap(" ".join(words).strip(), last_words)
+        clean = _clean_text(text)
+        if _is_hallucination(text, recent_texts):
+            recent_texts.append(clean)
+            return
+        recent_texts.append(clean)
+        last_words = (last_words + text.split())[-20:]
+        ts   = datetime.now().strftime("%H:%M:%S")
+        line = _format_line(ts, label, spk, text)
+        print(line)
+        append_transcript(line, output_file)
 
     while not stop_event.is_set():
         try:
@@ -677,259 +317,196 @@ def transcriber_with_diarization(audio_queue, stop_event, model_size, device, co
         except queue.Empty:
             continue
 
-        audio = pcm_to_float32(raw_audio)
-        if audio is None:
+        arr = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+        if arr.size == 0 or float(np.sqrt(np.mean(arr ** 2))) < 0.003:
             continue
 
-        # Pre-Whisper silence gate on float32 audio
-        if float(np.sqrt(np.mean(audio ** 2))) < TRANSCRIBE_RMS_MIN:
+        segments = stt_adapter.transcribe_segments(raw_audio, language)
+        if not segments:
             continue
 
         try:
-            # 1. Transcribe with word-level timestamps
-            segments, _ = model.transcribe(
-                audio,
-                language=language if language != "auto" else None,
-                beam_size=1,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                word_timestamps=True,
-                no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-                compression_ratio_threshold=WHISPER_COMPRESSION_RATIO,
-            )
-            segments = list(segments)
-            if not segments:
-                continue
-
-            # 2. Diarize the chunk
-            waveform = torch.from_numpy(audio).unsqueeze(0).float()
-            # Use num_speakers as a soft maximum so pyannote doesn't complain
-            # when a short chunk contains fewer active speakers than the hint.
+            waveform      = torch.from_numpy(arr).unsqueeze(0).float()
             diarize_kwargs = {"min_speakers": 1, "max_speakers": num_speakers} if num_speakers else {}
-            diarization = diarization_pipeline(
+            diarization   = diarization_pipeline(
                 {"waveform": waveform, "sample_rate": SAMPLE_RATE},
                 **diarize_kwargs,
             )
-
-            # 3. Extract embedding per speaker turn → resolve to tracker name
             speaker_turns = []
             for turn, _, _ in diarization.itertracks(yield_label=True):
                 if (turn.end - turn.start) < MIN_TURN_SECONDS:
                     continue
                 s = int(turn.start * SAMPLE_RATE)
                 e = int(turn.end * SAMPLE_RATE)
-                turn_audio = audio[s:e]
+                turn_audio = arr[s:e]
                 if turn_audio.size == 0:
                     continue
-                turn_waveform = torch.from_numpy(turn_audio).unsqueeze(0).float()
+                tw = torch.from_numpy(turn_audio).unsqueeze(0).float()
                 with torch.no_grad():
-                    emb = embedding_model({"waveform": turn_waveform, "sample_rate": SAMPLE_RATE})
+                    emb = embedding_model({"waveform": tw, "sample_rate": SAMPLE_RATE})
                 resolved = speaker_tracker.match(_emb_to_numpy(emb))
                 speaker_turns.append((turn.start, turn.end, resolved))
+        except Exception as exc:
+            print(f"[ERROR] Diarization failed: {exc}")
+            continue
 
-            # 4. Align transcription words to speaker turns, group by speaker
-            current_speaker = None
-            current_words = []
-
-            def flush(spk, words):
-                nonlocal last_output_words
-                text = _strip_prefix_overlap(" ".join(words).strip(), last_output_words)
-                clean = _clean_text(text)
-                if _is_hallucination(text, recent_texts):
-                    recent_texts.append(clean)
-                    return
-                recent_texts.append(clean)
-                last_output_words = (last_output_words + text.split())[-20:]
-                ts = datetime.now().strftime("%H:%M:%S")
-                line = _format_line(ts, label, spk, text)
-                print(line)
-                append_transcript(line, output_file)
-
-            for seg in segments:
-                words = seg.words if seg.words else []
-                if not words:
-                    spk = _get_speaker_at(speaker_turns, seg.start, seg.end)
-                    if spk != current_speaker:
-                        flush(current_speaker, current_words)
-                        current_speaker, current_words = spk, []
-                    current_words.append(seg.text.strip())
-                    continue
-
-                for word in words:
-                    spk = _get_speaker_at(speaker_turns, word.start, word.end)
-                    if spk != current_speaker:
-                        flush(current_speaker, current_words)
-                        current_speaker, current_words = spk, []
-                    current_words.append(word.word.strip())
-
-            flush(current_speaker, current_words)
-
-        except Exception as e:
-            print(f"[ERROR] Transcription/diarization failed: {e}")
+        current_speaker, current_words = None, []
+        for seg in segments:
+            words = seg.words if seg.words else []
+            if not words:
+                spk = _get_speaker_at(speaker_turns, seg.start, seg.end)
+                if spk != current_speaker:
+                    flush(current_speaker, current_words, label)
+                    current_speaker, current_words = spk, []
+                current_words.append(seg.text.strip())
+                continue
+            for word in words:
+                spk = _get_speaker_at(speaker_turns, word.start, word.end)
+                if spk != current_speaker:
+                    flush(current_speaker, current_words, label)
+                    current_speaker, current_words = spk, []
+                current_words.append(word.word.strip())
+        flush(current_speaker, current_words, label)
 
 
-# =========================
-# Summarization
-# =========================
+# ── DI wiring helpers ─────────────────────────────────────────────────────────
 
-def summarize_transcript(transcript_path: str, api_key: str = None):
+def _pick_stt_adapter(args, saved_stt_config):
+    """Build STT adapter: CLI flags (model/language) override saved config."""
+    from application.stt_service import STTService
+    from domain.entities import STTConfig, STTProvider
+
+    # CLI --model / --language always win
+    config = STTConfig(
+        provider = saved_stt_config.provider,
+        model    = args.model if args.model != DEFAULT_MODEL else saved_stt_config.model,
+        language = args.language if args.language != DEFAULT_LANGUAGE else saved_stt_config.language,
+        api_url  = saved_stt_config.api_url,
+        api_key  = saved_stt_config.api_key,
+    )
+    return STTService(config).get_adapter()
+
+
+def _pick_audio_adapter(args):
+    """Return the appropriate AudioCapturePort based on CLI flags."""
+    from adapters.audio.wasapi_loopback_adapter import WASAPILoopbackAdapter
+    from adapters.audio.dshow_mic_adapter import DShowMicAdapter
+    from adapters.audio.merge_adapter import MergeAdapter
+
+    if args.merge:
+        return MergeAdapter(mic_device=args.mic, loopback_hint=args.device)
+    elif args.loopback:
+        return WASAPILoopbackAdapter(device_hint=args.device)
+    else:
+        return DShowMicAdapter(device_name=args.device, debug=args.debug_audio)
+
+
+# ── run_recording ─────────────────────────────────────────────────────────────
+
+def run_recording(stt_adapter, audio_adapter, output_path, args, audio_saver, summarizer):
+    audio_queue = queue.Queue()
+    stop_event  = threading.Event()
+    threads     = []
+
+    # Audio capture thread
+    threads.append(threading.Thread(
+        target=audio_adapter.stream,
+        kwargs=dict(
+            audio_queue=audio_queue,
+            stop_event=stop_event,
+            chunk_seconds=args.chunk,
+            overlap_seconds=args.overlap,
+            debug=args.debug_audio,
+            audio_saver=audio_saver,
+        ),
+        daemon=True,
+    ))
+
+    # Transcription thread
+    if args.diarize:
+        hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+        if not hf_token:
+            print("[ERROR] Diarization requires a HuggingFace token.")
+            sys.exit(1)
+        torch_device = "cuda" if _has_cuda() else "cpu"
+        pipeline, embedding_model = load_diarization_models(hf_token, torch_device)
+        tracker = SpeakerTracker(similarity_threshold=0.75)
+        if args.speaker_profiles:
+            load_speaker_profiles(args.speaker_profiles, embedding_model, tracker)
+        threads.append(threading.Thread(
+            target=_diarized_transcription_loop,
+            args=(stt_adapter, audio_queue, stop_event, args.language, output_path,
+                  pipeline, embedding_model, tracker, args.num_speakers),
+            daemon=True,
+        ))
+    else:
+        threads.append(threading.Thread(
+            target=_plain_transcription_loop,
+            args=(stt_adapter, audio_queue, stop_event, args.language, output_path),
+            daemon=True,
+        ))
+
+    for t in threads:
+        t.start()
+
     try:
-        import anthropic
-    except ImportError:
-        print("[ERROR] Summarization requires: pip install anthropic")
-        return
+        while not stop_event.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopping…")
+        stop_event.set()
+    finally:
+        audio_adapter.close()
+        print(f"[INFO] Done. Transcript saved to: {output_path}")
+        if audio_saver:
+            audio_saver.save()
+        if summarizer:
+            summarizer.summarize(output_path)
 
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        print("[ERROR] --summarize requires ANTHROPIC_API_KEY env var or --api-key.")
-        return
 
+def _has_cuda() -> bool:
     try:
-        with open(transcript_path, encoding="utf-8") as f:
-            transcript = f.read().strip()
-    except FileNotFoundError:
-        print(f"[WARN] Transcript file not found: {transcript_path}")
-        return
-
-    if not transcript:
-        print("[INFO] Transcript is empty — skipping summary.")
-        return
-    if len(transcript.splitlines()) < 3:
-        print("[INFO] Transcript too short for a meaningful summary.")
-        return
-
-    print("[INFO] Generating meeting summary...", flush=True)
-
-    prompt = f"""You are a professional meeting assistant. \
-Analyze the following conversation transcript and produce a structured summary \
-in the SAME language as the transcript.
-
-TRANSCRIPT:
-{transcript}
-
-Write the summary using these sections exactly:
-
-## Overview
-2–3 sentences describing what was discussed.
-
-## Key Decisions & Agreements
-Bullet list of decisions or agreements reached. Write "None identified" if none.
-
-## Action Items
-Bullet list of concrete tasks, with the responsible person when mentioned. \
-Write "None identified" if none.
-
-## Next Steps
-What should happen after this conversation ends. Write "None identified" if none.
-
-## Notable Points
-Any other important facts, context, risks, or follow-up items worth remembering."""
-
-    try:
-        client = anthropic.Anthropic(api_key=key)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        summary = response.content[0].text
-
-        summary_path = transcript_path.replace(".txt", "_summary.txt")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write(f"Transcript Summary\n")
-            f.write(f"Source : {transcript_path}\n")
-            f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 60 + "\n\n")
-            f.write(summary + "\n")
-
-        sep = "=" * 60
-        print(f"\n{sep}\n  MEETING SUMMARY\n{sep}")
-        print(summary)
-        print(sep)
-        print(f"[INFO] Summary saved to: {summary_path}")
-    except Exception as e:
-        print(f"[ERROR] Summarization failed: {e}")
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
 
 
-# =========================
-# Entry point
-# =========================
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _make_output_path(name_or_prefix: str) -> str:
+    p    = Path(name_or_prefix)
+    stem = p.stem if p.suffix.lower() == ".txt" else p.name
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return str(p.parent / f"{stem}_{ts}.txt")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Real-time speech-to-text with optional speaker diarization on Windows"
     )
-    # Device selection
-    parser.add_argument("--list-devices", action="store_true",
-                        help="List available input and loopback devices and exit")
-    parser.add_argument("--device", "-d", type=str, default=None,
-                        help="Microphone device name (dshow) or loopback device hint")
-    parser.add_argument("--loopback", action="store_true",
-                        help="Capture speaker output via WASAPI loopback")
-    parser.add_argument("--merge", action="store_true",
-                        help="Capture both microphone and speakers simultaneously")
-    parser.add_argument("--mic", type=str, default=None,
-                        help="Microphone device name for --merge mode")
-
-    # Whisper
+    parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--device", "-d", type=str, default=None)
+    parser.add_argument("--loopback", action="store_true")
+    parser.add_argument("--merge", action="store_true")
+    parser.add_argument("--mic", type=str, default=None)
     parser.add_argument("--model", "-m", type=str, default=DEFAULT_MODEL,
-                        choices=["tiny", "tiny.en", "base", "base.en", "small", "small.en",
-                                 "medium", "medium.en", "large-v1", "large-v2", "large-v3"],
-                        help=f"Whisper model size (default: {DEFAULT_MODEL})")
-    parser.add_argument("--language", "-l", type=str, default=DEFAULT_LANGUAGE,
-                        help='Language code e.g. "en", "es", or "auto" (default: en)')
-
-    # Diarization
-    parser.add_argument("--diarize", action="store_true",
-                        help="Enable speaker diarization (requires pyannote.audio and HF token)")
-    parser.add_argument("--hf-token", type=str, default=None,
-                        help="HuggingFace token for pyannote models (or set HF_TOKEN env var)")
-    parser.add_argument("--num-speakers", type=int, default=None,
-                        help="Expected number of speakers (optional hint, 1-10)")
-    parser.add_argument("--speaker-profiles", type=str, default=None,
-                        help="Directory of .wav files for named speaker identification "
-                             "(filename = speaker name, e.g. Alice.wav)")
-
-    # Audio tuning
-    parser.add_argument("--chunk", type=float, default=DEFAULT_CHUNK_SECONDS,
-                        help=f"Audio chunk size in seconds (default: {DEFAULT_CHUNK_SECONDS})")
-    parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP_SECONDS,
-                        help=f"Overlap between chunks in seconds (default: {DEFAULT_OVERLAP_SECONDS})")
-
-    # Output / misc
-    parser.add_argument("--output", "-o", type=str, default=OUTPUT_PREFIX,
-                        help=(
-                            f"Transcript file name or prefix (default: '{OUTPUT_PREFIX}'). "
-                            "A timestamp is always appended, e.g. transcript_20260612_175830.txt"
-                        ))
-    parser.add_argument("--cpu", action="store_true",
-                        help="Force CPU even if a GPU is available")
-    parser.add_argument("--debug-audio", action="store_true",
-                        help="Print RMS level of each audio chunk")
-
-    # Audio saving
-    parser.add_argument("--save-audio", nargs="?", const="audio", metavar="PREFIX",
-                        help="Save captured audio to a WAV file. "
-                             "Optional prefix (default: 'audio'). "
-                             "Timestamp is appended: audio_20260612_175830.wav")
-
-    # Summarization
-    parser.add_argument("--summarize", action="store_true",
-                        help="Generate a structured meeting summary when recording stops "
-                             "(requires ANTHROPIC_API_KEY env var or --api-key)")
-    parser.add_argument("--api-key", type=str, default=None, metavar="KEY",
-                        help="Anthropic API key for --summarize "
-                             "(default: ANTHROPIC_API_KEY env var)")
+                        choices=["tiny","tiny.en","base","base.en","small","small.en",
+                                 "medium","medium.en","large-v1","large-v2","large-v3"])
+    parser.add_argument("--language", "-l", type=str, default=DEFAULT_LANGUAGE)
+    parser.add_argument("--diarize", action="store_true")
+    parser.add_argument("--hf-token", type=str, default=None)
+    parser.add_argument("--num-speakers", type=int, default=None)
+    parser.add_argument("--speaker-profiles", type=str, default=None)
+    parser.add_argument("--chunk", type=float, default=DEFAULT_CHUNK_SECONDS)
+    parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP_SECONDS)
+    parser.add_argument("--output", "-o", type=str, default=OUTPUT_PREFIX)
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--debug-audio", action="store_true")
+    parser.add_argument("--save-audio", nargs="?", const="audio", metavar="PREFIX")
+    parser.add_argument("--summarize", action="store_true")
+    parser.add_argument("--api-key", type=str, default=None)
     return parser.parse_args()
-
-
-def _make_output_path(name_or_prefix: str) -> str:
-    """Return a timestamped output path, e.g. 'meeting_20260612_175830.txt'."""
-    p = Path(name_or_prefix)
-    stem = p.stem if p.suffix.lower() == ".txt" else p.name
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return str(p.parent / f"{stem}_{ts}.txt")
 
 
 def main():
@@ -941,137 +518,34 @@ def main():
 
     if args.merge and not args.mic:
         print("[ERROR] --merge requires --mic <microphone device name>.")
-        print('Example: python main.py --merge --mic "Microphone (HyperX Quadcast)"\n')
         sys.exit(1)
 
     if not args.loopback and not args.merge and not args.device:
-        print("[ERROR] No audio device specified. Run --list-devices to see options.\n")
-        print("Examples:")
-        print('  python main.py --device "Microphone (HyperX Quadcast)"')
-        print('  python main.py --loopback')
-        print('  python main.py --merge --mic "Microphone (HyperX Quadcast)"')
-        print('  python main.py --device "Microphone (HyperX Quadcast)" --diarize\n')
+        print("[ERROR] No audio device specified. Run --list-devices to see options.")
         sys.exit(1)
 
-    args.output = _make_output_path(args.output)
-    print(f"[INFO] Transcript will be saved to: {args.output}")
+    # Load saved config; CLI args for model/language take precedence
+    from application.config_service import ConfigService
+    saved_cfg = ConfigService().get()
 
-    # Audio saver setup
+    stt_adapter   = _pick_stt_adapter(args, saved_cfg.stt)
+    audio_adapter = _pick_audio_adapter(args)
+
+    output_path = _make_output_path(args.output)
+    print(f"[INFO] Transcript will be saved to: {output_path}")
+
     audio_saver = None
     if args.save_audio is not None:
-        prefix = args.save_audio  # either the given prefix or "audio" (const)
-        audio_path = _make_output_path(prefix).replace(".txt", ".wav")
+        audio_path  = _make_output_path(args.save_audio).replace(".txt", ".wav")
         audio_saver = AudioSaver(audio_path)
         print(f"[INFO] Audio will be saved to: {audio_path}")
 
-    # GPU/CPU
-    if args.cpu:
-        whisper_device, compute_type = "cpu", "int8"
-        torch_device = "cpu"
-        print("[INFO] Forced CPU mode.")
-    else:
-        whisper_device, compute_type = detect_device()
-        torch_device = "cuda" if whisper_device == "cuda" else "cpu"
+    summarizer = None
+    if args.summarize:
+        from adapters.summarization.claude_summarizer_adapter import ClaudeSummarizerAdapter
+        summarizer = ClaudeSummarizerAdapter(api_key=args.api_key)
 
-    chunk_bytes = int(SAMPLE_RATE * args.chunk) * BYTES_PER_SAMPLE
-    overlap_bytes = int(SAMPLE_RATE * args.overlap) * BYTES_PER_SAMPLE
-
-    audio_queue = queue.Queue()
-    stop_event = threading.Event()
-    threads = []
-    process = None
-
-    # --- Audio capture threads ---
-    if args.merge:
-        process = start_ffmpeg(args.mic, debug=args.debug_audio)
-        threads.append(threading.Thread(target=ffmpeg_error_reader, args=(process, stop_event), daemon=True))
-        threads.append(threading.Thread(
-            target=audio_reader,
-            kwargs=dict(audio_saver=audio_saver),
-            args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, "MIC", args.debug_audio),
-            daemon=True,
-        ))
-        threads.append(threading.Thread(
-            target=loopback_reader,
-            kwargs=dict(audio_saver=audio_saver),
-            args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, "SPK", args.debug_audio),
-            daemon=True,
-        ))
-    elif args.loopback:
-        threads.append(threading.Thread(
-            target=loopback_reader,
-            kwargs=dict(audio_saver=audio_saver),
-            args=(audio_queue, stop_event, args.device, args.chunk, args.overlap, "", args.debug_audio),
-            daemon=True,
-        ))
-    else:
-        process = start_ffmpeg(args.device, debug=args.debug_audio)
-        threads.append(threading.Thread(target=ffmpeg_error_reader, args=(process, stop_event), daemon=True))
-        threads.append(threading.Thread(
-            target=audio_reader,
-            kwargs=dict(audio_saver=audio_saver),
-            args=(process, audio_queue, stop_event, chunk_bytes, overlap_bytes, "", args.debug_audio),
-            daemon=True,
-        ))
-
-    # --- Transcription thread ---
-    if args.diarize:
-        hf_token = args.hf_token or os.environ.get("HF_TOKEN")
-        if not hf_token:
-            print("[ERROR] Diarization requires a HuggingFace token.")
-            print("  Set it with --hf-token YOUR_TOKEN or the HF_TOKEN environment variable.")
-            print("  Get a token at https://huggingface.co/settings/tokens")
-            print("  Then accept model terms at:")
-            print("    https://huggingface.co/pyannote/speaker-diarization-3.1")
-            print("    https://huggingface.co/pyannote/segmentation-3.0")
-            sys.exit(1)
-
-        diarization_pipeline, embedding_model = load_diarization_models(hf_token, torch_device)
-
-        tracker = SpeakerTracker(similarity_threshold=0.75)
-        if args.speaker_profiles:
-            load_speaker_profiles(args.speaker_profiles, embedding_model, tracker)
-
-        threads.append(threading.Thread(
-            target=transcriber_with_diarization,
-            args=(audio_queue, stop_event, args.model, whisper_device, compute_type,
-                  args.language, args.output, diarization_pipeline, embedding_model,
-                  tracker, args.num_speakers),
-            daemon=True,
-        ))
-    else:
-        threads.append(threading.Thread(
-            target=transcriber,
-            args=(audio_queue, stop_event, args.model, whisper_device, compute_type,
-                  args.language, args.output),
-            daemon=True,
-        ))
-
-    for t in threads:
-        t.start()
-
-    try:
-        while not stop_event.is_set():
-            time.sleep(0.5)
-            if process and process.poll() is not None:
-                print("[ERROR] FFmpeg process exited unexpectedly.")
-                stop_event.set()
-                break
-    except KeyboardInterrupt:
-        print("\n[INFO] Stopping...")
-        stop_event.set()
-    finally:
-        if process:
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except Exception:
-                process.kill()
-        print(f"[INFO] Done. Transcript saved to: {args.output}")
-        if audio_saver:
-            audio_saver.save()
-        if args.summarize:
-            summarize_transcript(args.output, api_key=args.api_key)
+    run_recording(stt_adapter, audio_adapter, output_path, args, audio_saver, summarizer)
 
 
 if __name__ == "__main__":
