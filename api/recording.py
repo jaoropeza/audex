@@ -125,9 +125,11 @@ async def start_recording(req: StartRequest):
 
     from application.config_service import ConfigService
     stt_cfg = ConfigService().get().stt
-    model    = req.model    or stt_cfg.model    or "small"
-    language = req.language or stt_cfg.language or "en"
-    cmd += ["--model", model, "--language", language]
+    model    = req.model    or stt_cfg.model    or "large-v3"
+    language = req.language or stt_cfg.language or "es"
+    cmd += ["--model", model]
+    if language and language != "auto":
+        cmd += ["--language", language]
     cmd += ["--output", req.output_prefix]
 
     if req.diarize:

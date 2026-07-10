@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from api import transcripts, stream, recording, translate, config as config_api
+from api import transcripts, stream, recording, translate, config as config_api, db as db_api
 
 app = FastAPI(title="STT Web UI", version="1.0.0")
 
@@ -22,11 +22,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        from application.db_service import startup_index
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, startup_index)
+    except Exception as exc:
+        print(f"[WARN] DB startup index failed: {exc}")
+
+
 app.include_router(transcripts.router,  prefix="/api/transcripts", tags=["transcripts"])
 app.include_router(stream.router,       prefix="/api/stream",       tags=["stream"])
 app.include_router(recording.router,    prefix="/api/recording",    tags=["recording"])
 app.include_router(translate.router,    prefix="/api",              tags=["translate"])
 app.include_router(config_api.router,   prefix="/api",              tags=["config"])
+app.include_router(db_api.router,       prefix="/api/db",           tags=["db"])
 
 # Serve React build. Must be registered AFTER API routes.
 _static = Path(__file__).parent / "frontend" / "dist"

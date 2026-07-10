@@ -1,13 +1,15 @@
 import os
 from pathlib import Path
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 router = APIRouter()
 PROJECT_DIR = Path(__file__).parent.parent
 
 
 def _is_safe(filename: str) -> bool:
-    """Reject path traversal and non-transcript files."""
     try:
         target = (PROJECT_DIR / filename).resolve()
         return (
@@ -64,9 +66,15 @@ async def delete_transcript(filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Transcript not found")
     path.unlink()
-    summary = path.with_name(path.stem + "_summary.txt")
-    if summary.exists():
-        summary.unlink()
+    summary_file = path.with_name(path.stem + "_summary.txt")
+    if summary_file.exists():
+        summary_file.unlink()
+    # Remove from DB
+    try:
+        from application.db_service import DBService
+        DBService()  # lazy init; no explicit delete needed (cascade via FK)
+    except Exception:
+        pass
     return {"deleted": filename}
 
 
@@ -85,3 +93,68 @@ async def search_transcript(filename: str, q: str = Query(..., min_length=1)):
             if stripped and term in stripped.lower():
                 matches.append({"line_number": i, "text": stripped})
     return {"query": q, "matches": matches}
+
+
+@router.get("/{filename}/summary")
+async def get_summary(filename: str):
+    if not _is_safe(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    from application.db_service import DBService
+    db = DBService()
+    row = db.get_summary(filename)
+    if not row:
+        raise HTTPException(status_code=404, detail="No summary found")
+    return row
+
+
+class SummarizeRequest(BaseModel):
+    prompt_template: Optional[str] = None
+
+
+@router.post("/{filename}/summarize")
+async def summarize_transcript(filename: str, body: SummarizeRequest = SummarizeRequest()):
+    if not _is_safe(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = PROJECT_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Transcript not found")
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        transcript_text = f.read().strip()
+
+    if not transcript_text:
+        raise HTTPException(status_code=422, detail="Transcript is empty")
+    if len(transcript_text.splitlines()) < 3:
+        raise HTTPException(status_code=422, detail="Transcript too short to summarize")
+
+    from application.config_service import ConfigService
+    from application.summary_service import SummaryService
+    from application.db_service import DBService
+
+    cfg = ConfigService().get().summary
+    svc = SummaryService(cfg)
+
+    try:
+        summary_text = await svc.summarize(transcript_text, body.prompt_template)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    db = DBService()
+    # Ensure the transcript row exists before inserting the FK-referenced summary
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        all_lines = [ln.rstrip() for ln in f if ln.strip()]
+    db.index(filename, all_lines)
+    db.save_summary(
+        filename,
+        summary_text,
+        provider=cfg.provider.value,
+        model=cfg.model,
+        prompt_used=body.prompt_template or cfg.prompt_template,
+    )
+
+    return {
+        "filename": filename,
+        "summary": summary_text,
+        "provider": cfg.provider.value,
+        "model": cfg.model,
+    }

@@ -33,6 +33,7 @@ const LLM_URL_HINTS = {
 };
 
 const LANGUAGES = [
+  { value: "auto", label: "Auto-detect" },
   { value: "en", label: "English" }, { value: "es", label: "Spanish" },
   { value: "fr", label: "French" },  { value: "de", label: "German" },
   { value: "it", label: "Italian" }, { value: "pt", label: "Portuguese" },
@@ -72,6 +73,57 @@ What should happen after this conversation ends. Write "None identified" if none
 
 ## Notable Points
 Any other important facts, context, risks, or follow-up items worth remembering.`;
+
+export const SUMMARY_PRESETS = {
+  en: {
+    label: "English",
+    prompt: `You are a professional meeting assistant. Analyze the following conversation transcript and produce a structured summary.
+
+TRANSCRIPT:
+{transcript}
+
+Write the summary using these sections exactly:
+
+## Overview
+2–3 sentences describing what was discussed.
+
+## Key Decisions & Agreements
+Bullet list of decisions or agreements reached. Write "None identified" if none.
+
+## Action Items
+Bullet list of concrete tasks, with the responsible person when mentioned. Write "None identified" if none.
+
+## Next Steps
+What should happen after this conversation ends. Write "None identified" if none.
+
+## Notable Points
+Any other important facts, context, risks, or follow-up items worth remembering.`,
+  },
+  es: {
+    label: "Español",
+    prompt: `Eres un asistente profesional de reuniones. Analiza la siguiente transcripción de conversación y produce un resumen estructurado.
+
+TRANSCRIPCIÓN:
+{transcript}
+
+Escribe el resumen usando exactamente estas secciones:
+
+## Resumen General
+2–3 oraciones describiendo qué se discutió.
+
+## Decisiones y Acuerdos Clave
+Lista de decisiones o acuerdos alcanzados. Escribe "Ninguno identificado" si no hay.
+
+## Elementos de Acción
+Lista de tareas concretas, con la persona responsable cuando se mencione. Escribe "Ninguno identificado" si no hay.
+
+## Próximos Pasos
+Qué debe ocurrir después de que termine esta conversación. Escribe "Ninguno identificado" si no hay.
+
+## Puntos Notables
+Cualquier otro hecho importante, contexto, riesgos o elementos de seguimiento que valga la pena recordar.`,
+  },
+};
 
 const fieldCls = "block w-full rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-400 dark:placeholder-gray-500";
 const labelCls = "block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1 uppercase tracking-wide";
@@ -357,14 +409,39 @@ export default function ModelConfig() {
               <TestButton type="summary" onTest={(t) => test(t, draft)} result={testResults.summary} isTesting={testing.summary} />
             </div>
 
-            <Field label="Prompt template" hint="Parameter: {transcript} — leave empty to use default">
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className={labelCls}>Prompt template</label>
+                <div className="flex gap-1">
+                  {Object.entries(SUMMARY_PRESETS).map(([key, preset]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setSummary("prompt_template", preset.prompt)}
+                      className="text-[10px] px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                  {summ.prompt_template && (
+                    <button
+                      type="button"
+                      onClick={() => setSummary("prompt_template", null)}
+                      className="text-[10px] px-2 py-0.5 rounded border border-red-200 dark:border-red-800 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
               <textarea
                 className={`${promptCls} h-full min-h-[200px]`}
                 value={summ.prompt_template || ""}
                 placeholder={DEFAULT_SUMMARY_PROMPT}
                 onChange={(e) => setSummary("prompt_template", e.target.value || null)}
               />
-            </Field>
+              <p className="mt-1 text-[10px] text-gray-400 dark:text-gray-500">Parameter: {"{transcript}"} — leave empty to use default</p>
+            </div>
           </div>
         </Card>
 
