@@ -9,20 +9,27 @@ from domain.ports.translation_port import TranslationPort
 _NUMBERED = re.compile(r"^\d+\.\s+(.*)", re.DOTALL)
 
 
-def _resolve_prompt(config, texts: list[str], target_language: str) -> str:
-    if config.prompt_template:
-        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+def _build_prompt(
+    texts: list[str],
+    target_language: str,
+    source_language: str = "auto",
+    prompt_template: str | None = None,
+) -> str:
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    if prompt_template:
         try:
-            return config.prompt_template.format(texts=numbered, target_language=target_language)
+            return prompt_template.format(
+                source_lang=source_language if source_language != "auto" else "the source language",
+                target_lang=target_language,
+                source_code=source_language,
+                target_code=target_language,
+                texts=numbered,
+            )
         except (KeyError, ValueError):
             pass
-    return _build_prompt(texts, target_language)
-
-
-def _build_prompt(texts: list[str], target_language: str) -> str:
-    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    src_clause = f"from {source_language} " if source_language not in ("auto", "Auto") else ""
     return (
-        f"Translate the following numbered transcript lines into {target_language}.\n"
+        f"Translate the following numbered transcript lines {src_clause}into {target_language}.\n"
         "Rules:\n"
         '- Return ONLY the numbered lines in the same format: "1. translated text"\n'
         "- Do NOT translate proper nouns, product names, or technical terms.\n"
@@ -52,13 +59,24 @@ class GeminiAdapter(TranslationPort):
         genai.configure(api_key=key)
         return genai
 
-    async def translate(self, texts: list[str], target_language: str) -> list[str]:
+    async def translate(
+        self,
+        texts: list[str],
+        target_language: str,
+        source_language: str = "auto",
+        prompt_template: str | None = None,
+    ) -> list[str]:
         import asyncio
         genai = self._configure()
         model = genai.GenerativeModel(self._config.model)
+        prompt = _build_prompt(
+            texts, target_language,
+            source_language=source_language,
+            prompt_template=prompt_template or self._config.prompt_template,
+        )
 
         def _run():
-            response = model.generate_content(_resolve_prompt(self._config, texts, target_language))
+            response = model.generate_content(prompt)
             return response.text
 
         raw = await asyncio.get_event_loop().run_in_executor(None, _run)

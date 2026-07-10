@@ -10,28 +10,78 @@ from domain.ports.translation_port import TranslationPort
 _NUMBERED = re.compile(r"^\d+\.\s+(.*)", re.DOTALL)
 _DEFAULT_URL = "http://localhost:11434"
 
+# ISO 639 codes for the languages shown in the UI
+_LANG_CODES: dict[str, str] = {
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Portuguese": "pt",
+    "Italian": "it",
+    "Japanese": "ja",
+    "Chinese": "zh-Hans",
+    "Arabic": "ar",
+    "Russian": "ru",
+    "Korean": "ko",
+    "Dutch": "nl",
+    "Polish": "pl",
+}
 
-def _resolve_prompt(config, texts: list[str], target_language: str) -> str:
-    if config.prompt_template:
-        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
-        try:
-            return config.prompt_template.format(texts=numbered, target_language=target_language)
-        except (KeyError, ValueError):
-            pass
-    return _build_prompt(texts, target_language)
 
-
-def _build_prompt(texts: list[str], target_language: str) -> str:
+def _build_prompt(
+    texts: list[str],
+    target_language: str,
+    source_language: str = "auto",
+    prompt_template: str | None = None,
+) -> str:
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
-    return (
-        f"Translate the following numbered transcript lines into {target_language}.\n"
-        "Rules:\n"
-        '- Return ONLY the numbered lines in the same format: "1. translated text"\n'
-        "- Do NOT translate proper nouns, product names, or technical terms.\n"
-        "- Preserve natural spoken-word flow; these are transcribed speech lines.\n"
-        "- If a line is already in the target language, copy it unchanged.\n\n"
-        f"{numbered}"
-    )
+    tgt_code = _LANG_CODES.get(target_language, "")
+    src_code = _LANG_CODES.get(source_language, "")
+
+    if prompt_template:
+        tgt_spec  = f"{target_language} ({tgt_code})" if tgt_code else target_language
+        src_spec  = (
+            f"{source_language} ({src_code})" if src_code
+            else ("the source language" if source_language in ("auto", "Auto") else source_language)
+        )
+        try:
+            return prompt_template.format(
+                source_lang=src_spec,
+                target_lang=tgt_spec,
+                source_code=src_code or "auto",
+                target_code=tgt_code,
+                texts=numbered,
+            )
+        except (KeyError, ValueError):
+            pass  # fall through to default
+
+    # ── translategemma-style default prompt ──────────────────────────────────
+    tgt_spec = f"{target_language} ({tgt_code})" if tgt_code else target_language
+
+    if source_language in ("auto", "Auto"):
+        instruction = (
+            f"You are a professional translator. "
+            f"Your goal is to accurately convey the meaning and nuances of the original text "
+            f"while adhering to {tgt_spec} grammar, vocabulary, and cultural sensitivities. "
+            f"Produce only the {tgt_spec} translation of each numbered line, "
+            f"keeping the exact same numbered format (1. 2. 3. etc). "
+            f"Do not add explanations, commentary, or extra text. "
+            f"Please translate the following text into {tgt_spec}:"
+        )
+    else:
+        src_spec = f"{source_language} ({src_code})" if src_code else source_language
+        instruction = (
+            f"You are a professional {src_spec} to {tgt_spec} translator. "
+            f"Your goal is to accurately convey the meaning and nuances of the original {source_language} text "
+            f"while adhering to {tgt_spec} grammar, vocabulary, and cultural sensitivities. "
+            f"Produce only the {tgt_spec} translation of each numbered line, "
+            f"keeping the exact same numbered format (1. 2. 3. etc). "
+            f"Do not add explanations, commentary, or extra text. "
+            f"Please translate the following {source_language} text into {tgt_spec}:"
+        )
+
+    # Two blank lines before the text — required by translategemma
+    return f"{instruction}\n\n\n{numbered}"
 
 
 def _parse_response(raw: str, original: list[str]) -> list[str]:
@@ -49,16 +99,25 @@ class OllamaAdapter(TranslationPort):
         self._config = config
         self._base_url = (config.api_url or _DEFAULT_URL).rstrip("/")
 
-    async def translate(self, texts: list[str], target_language: str) -> list[str]:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+    async def translate(
+        self,
+        texts: list[str],
+        target_language: str,
+        source_language: str = "auto",
+        prompt_template: str | None = None,
+    ) -> list[str]:
+        prompt = _build_prompt(
+            texts, target_language,
+            source_language=source_language,
+            prompt_template=prompt_template or self._config.prompt_template,
+        )
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
                 f"{self._base_url}/api/chat",
                 json={
                     "model": self._config.model,
                     "stream": False,
-                    "messages": [
-                        {"role": "user", "content": _resolve_prompt(self._config, texts, target_language)}
-                    ],
+                    "messages": [{"role": "user", "content": prompt}],
                 },
             )
             resp.raise_for_status()
@@ -72,7 +131,6 @@ class OllamaAdapter(TranslationPort):
                 resp.raise_for_status()
                 models = [m["name"] for m in resp.json().get("models", [])]
                 model_name = self._config.model
-                # Accept partial match (e.g. "translategemma:4b" in "translategemma:4b")
                 found = any(model_name in m or m in model_name for m in models)
                 if not found:
                     available = ", ".join(models) or "none pulled"

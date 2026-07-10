@@ -18,14 +18,14 @@ _PREFIX_RE = re.compile(r"^(\[\d{2}:\d{2}:\d{2}\](?:\[[^\]]+\])*)\s*(.*)", re.DO
 class TranslateRequest(BaseModel):
     lines: list[str]
     target_language: str = "English"
+    source_language: str = "auto"
+    prompt_template: str | None = None
 
     @field_validator("lines")
     @classmethod
     def check_lines(cls, v):
         if not v:
             raise ValueError("lines must not be empty")
-        if len(v) > 50:
-            raise ValueError("At most 50 lines per request")
         return v
 
 
@@ -46,7 +46,12 @@ async def translate_lines(req: TranslateRequest):
     service = TranslationService(cfg.translation)
 
     try:
-        translated = await service.translate(contents, req.target_language)
+        translated = await service.translate(
+            contents,
+            req.target_language,
+            source_language=req.source_language,
+            prompt_template=req.prompt_template,
+        )
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Translation error: {exc}")

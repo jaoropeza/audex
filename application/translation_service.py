@@ -31,8 +31,18 @@ class TranslationService:
             case _:
                 raise ValueError(f"Unknown translation provider: {self._config.provider}")
 
-    async def translate(self, texts: list[str], target_language: str) -> list[str]:
-        return await self.get_adapter().translate(texts, target_language)
+    async def translate(
+        self,
+        texts: list[str],
+        target_language: str,
+        source_language: str = "auto",
+        prompt_template: str | None = None,
+    ) -> list[str]:
+        return await self.get_adapter().translate(
+            texts, target_language,
+            source_language=source_language,
+            prompt_template=prompt_template,
+        )
 
     async def test(self) -> dict:
         try:

@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import TranscriptLine from "./TranscriptLine";
 import SummarizeModal from "./SummarizeModal";
+import TranslateModal from "./TranslateModal";
 import { useTranslation } from "../hooks/useTranslation";
-
-const LANGUAGES = ["English", "Spanish", "French", "Portuguese", "German", "Italian", "Japanese", "Chinese"];
 
 const inputCls = "rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-400";
 const btnCls   = "rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500";
@@ -141,7 +140,10 @@ export default function TranscriptViewer({ filename }) {
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [translateEnabled, setTranslateEnabled] = useState(false);
+  const [sourceLang, setSourceLang] = useState("Auto");
   const [targetLang, setTargetLang] = useState("English");
+  const [promptTemplate, setPromptTemplate] = useState(null);
+  const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [searchResults, setSearchResults] = useState(null);
   const [activeTab, setActiveTab] = useState("transcript");
 
@@ -150,7 +152,9 @@ export default function TranscriptViewer({ filename }) {
   const [showSummarizeModal, setShowSummarizeModal] = useState(false);
   const [audioInfo, setAudioInfo] = useState(null); // null=loading, false=none, object=exists
 
-  const { translations } = useTranslation(lines, targetLang, translateEnabled);
+  const { translations, translating, error: translateError } = useTranslation(
+    lines, sourceLang, targetLang, promptTemplate, translateEnabled
+  );
 
   useEffect(() => {
     if (!filename) return;
@@ -260,23 +264,36 @@ export default function TranscriptViewer({ filename }) {
                 Search
               </button>
             </form>
-            <label className="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300 cursor-pointer whitespace-nowrap">
-              <input
-                type="checkbox"
-                checked={translateEnabled}
-                onChange={(e) => setTranslateEnabled(e.target.checked)}
-                className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 w-3.5 h-3.5"
-              />
-              Translate
-            </label>
-            {translateEnabled && (
-              <select
-                className={`${inputCls} text-xs py-1`}
-                value={targetLang}
-                onChange={(e) => setTargetLang(e.target.value)}
+            {!translateEnabled ? (
+              <button
+                onClick={() => setShowTranslateModal(true)}
+                className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-md border border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-300 bg-white dark:bg-gray-700 hover:border-blue-400 hover:text-blue-600 dark:hover:text-blue-300 transition-colors whitespace-nowrap"
               >
-                {LANGUAGES.map((l) => <option key={l}>{l}</option>)}
-              </select>
+                🌐 Translate
+              </button>
+            ) : (
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setShowTranslateModal(true)}
+                  className="flex items-center gap-1 text-xs px-2.5 py-1 rounded-md border border-blue-400 dark:border-blue-500 text-blue-600 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/20 transition-colors whitespace-nowrap"
+                  title="Change translation settings"
+                >
+                  🌐 {sourceLang === "Auto" ? "Auto" : sourceLang} → {targetLang}
+                  {translating && <span className="ml-1 w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin" />}
+                </button>
+                <button
+                  onClick={() => setTranslateEnabled(false)}
+                  title="Disable translation"
+                  className="text-gray-400 hover:text-red-500 dark:hover:text-red-400 text-xs leading-none transition-colors px-0.5"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+            {translateError && translateEnabled && (
+              <span className="text-[10px] text-red-500 dark:text-red-400 truncate max-w-[140px]" title={translateError}>
+                {translateError}
+              </span>
             )}
           </>
         )}
@@ -386,6 +403,23 @@ export default function TranscriptViewer({ filename }) {
           lineCount={lines.length}
           onClose={() => setShowSummarizeModal(false)}
           onDone={handleSummaryDone}
+        />
+      )}
+
+      {showTranslateModal && (
+        <TranslateModal
+          lineCount={lines.length}
+          initialSource={sourceLang}
+          initialTarget={targetLang}
+          initialPrompt={promptTemplate || ""}
+          onClose={() => setShowTranslateModal(false)}
+          onApply={({ sourceLang: sl, targetLang: tl, promptTemplate: pt }) => {
+            setSourceLang(sl);
+            setTargetLang(tl);
+            setPromptTemplate(pt);
+            setTranslateEnabled(true);
+            setShowTranslateModal(false);
+          }}
         />
       )}
     </div>
