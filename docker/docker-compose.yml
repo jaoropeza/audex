@@ -1,0 +1,67 @@
+name: local-ai-stack
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: 24h
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama-model-loader:
+    image: ollama/ollama:latest
+    container_name: ollama-model-loader
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      # Add or remove Ollama models here.
+      OLLAMA_MODELS_TO_PULL: "translategemma:4b,llama3.2:3b,qwen2.5:7b"
+      # OLLAMA_MODELS_TO_PULL: "translategemma:4b"
+    entrypoint: ["/bin/sh", "-lc"]
+    command: |
+      echo "Waiting for Ollama..."
+      until ollama list >/dev/null 2>&1; do
+        sleep 2
+      done
+
+      echo "Pulling models: ${OLLAMA_MODELS_TO_PULL}"
+      IFS=','
+      for model in ${OLLAMA_MODELS_TO_PULL}; do
+        echo "Pulling ${model}"
+        ollama pull "${model}"
+      done
+
+      ollama pull translategemma:4b
+
+      echo "Model preload completed."
+    restart: "no"
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    ports:
+      - "3000:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+
+volumes:
+  ollama-data:
+  open-webui-data:

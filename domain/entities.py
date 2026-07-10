@@ -19,27 +19,45 @@ class TranslationProvider(str, Enum):
     GEMINI    = "gemini"
 
 
+class SummaryProvider(str, Enum):
+    ANTHROPIC = "anthropic"
+    OLLAMA    = "ollama"
+    OPENAI    = "openai"
+    GEMINI    = "gemini"
+
+
 @dataclass
 class STTConfig:
     provider: STTProvider   = STTProvider.FASTER_WHISPER
-    model:    str           = "small"
-    language: str           = "en"
+    model:    str           = "large-v3"
+    language: str           = "es"
     api_url:  Optional[str] = None
     api_key:  Optional[str] = None
 
 
 @dataclass
 class TranslationConfig:
-    provider: TranslationProvider = TranslationProvider.ANTHROPIC
-    model:    str                 = "claude-haiku-4-5-20251001"
-    api_url:  Optional[str]       = None
-    api_key:  Optional[str]       = None
+    provider:        TranslationProvider = TranslationProvider.ANTHROPIC
+    model:           str                 = "claude-haiku-4-5-20251001"
+    api_url:         Optional[str]       = None
+    api_key:         Optional[str]       = None
+    prompt_template: Optional[str]       = None
+
+
+@dataclass
+class SummaryConfig:
+    provider:        SummaryProvider = SummaryProvider.ANTHROPIC
+    model:           str             = "claude-haiku-4-5-20251001"
+    api_url:         Optional[str]   = None
+    api_key:         Optional[str]   = None
+    prompt_template: Optional[str]   = None
 
 
 @dataclass
 class AppSettings:
     stt:         STTConfig         = field(default_factory=STTConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
+    summary:     SummaryConfig     = field(default_factory=SummaryConfig)
 
     def to_dict(self) -> dict:
         return {
@@ -51,10 +69,18 @@ class AppSettings:
                 "api_key":  self.stt.api_key,
             },
             "translation": {
-                "provider": self.translation.provider.value,
-                "model":    self.translation.model,
-                "api_url":  self.translation.api_url,
-                "api_key":  self.translation.api_key,
+                "provider":        self.translation.provider.value,
+                "model":           self.translation.model,
+                "api_url":         self.translation.api_url,
+                "api_key":         self.translation.api_key,
+                "prompt_template": self.translation.prompt_template,
+            },
+            "summary": {
+                "provider":        self.summary.provider.value,
+                "model":           self.summary.model,
+                "api_url":         self.summary.api_url,
+                "api_key":         self.summary.api_key,
+                "prompt_template": self.summary.prompt_template,
             },
         }
 
@@ -62,18 +88,27 @@ class AppSettings:
     def from_dict(cls, d: dict) -> "AppSettings":
         stt_d   = d.get("stt", {})
         trans_d = d.get("translation", {})
+        summ_d  = d.get("summary", {})
         return cls(
             stt=STTConfig(
                 provider = STTProvider(stt_d.get("provider", STTProvider.FASTER_WHISPER)),
-                model    = stt_d.get("model", "small"),
-                language = stt_d.get("language", "en"),
+                model    = stt_d.get("model", "large-v3"),
+                language = stt_d.get("language", "es"),
                 api_url  = stt_d.get("api_url"),
                 api_key  = stt_d.get("api_key"),
             ),
             translation=TranslationConfig(
-                provider = TranslationProvider(trans_d.get("provider", TranslationProvider.ANTHROPIC)),
-                model    = trans_d.get("model", "claude-haiku-4-5-20251001"),
-                api_url  = trans_d.get("api_url"),
-                api_key  = trans_d.get("api_key"),
+                provider        = TranslationProvider(trans_d.get("provider", TranslationProvider.ANTHROPIC)),
+                model           = trans_d.get("model", "claude-haiku-4-5-20251001"),
+                api_url         = trans_d.get("api_url"),
+                api_key         = trans_d.get("api_key"),
+                prompt_template = trans_d.get("prompt_template"),
+            ),
+            summary=SummaryConfig(
+                provider        = SummaryProvider(summ_d.get("provider", SummaryProvider.ANTHROPIC)),
+                model           = summ_d.get("model", "claude-haiku-4-5-20251001"),
+                api_url         = summ_d.get("api_url"),
+                api_key         = summ_d.get("api_key"),
+                prompt_template = summ_d.get("prompt_template"),
             ),
         )

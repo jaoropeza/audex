@@ -9,6 +9,16 @@ from domain.ports.translation_port import TranslationPort
 _NUMBERED = re.compile(r"^\d+\.\s+(.*)", re.DOTALL)
 
 
+def _resolve_prompt(config, texts: list[str], target_language: str) -> str:
+    if config.prompt_template:
+        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+        try:
+            return config.prompt_template.format(texts=numbered, target_language=target_language)
+        except (KeyError, ValueError):
+            pass
+    return _build_prompt(texts, target_language)
+
+
 def _build_prompt(texts: list[str], target_language: str) -> str:
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
@@ -42,11 +52,12 @@ class AnthropicAdapter(TranslationPort):
         return anthropic.Anthropic(api_key=key)
 
     async def translate(self, texts: list[str], target_language: str) -> list[str]:
+        prompt = _resolve_prompt(self._config, texts, target_language)
         client = self._client()
         response = client.messages.create(
             model=self._config.model,
             max_tokens=2048,
-            messages=[{"role": "user", "content": _build_prompt(texts, target_language)}],
+            messages=[{"role": "user", "content": prompt}],
         )
         return _parse_response(response.content[0].text, texts)
 

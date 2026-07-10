@@ -9,6 +9,16 @@ from domain.ports.translation_port import TranslationPort
 _NUMBERED = re.compile(r"^\d+\.\s+(.*)", re.DOTALL)
 
 
+def _resolve_prompt(config, texts: list[str], target_language: str) -> str:
+    if config.prompt_template:
+        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+        try:
+            return config.prompt_template.format(texts=numbered, target_language=target_language)
+        except (KeyError, ValueError):
+            pass
+    return _build_prompt(texts, target_language)
+
+
 def _build_prompt(texts: list[str], target_language: str) -> str:
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
@@ -48,7 +58,7 @@ class GeminiAdapter(TranslationPort):
         model = genai.GenerativeModel(self._config.model)
 
         def _run():
-            response = model.generate_content(_build_prompt(texts, target_language))
+            response = model.generate_content(_resolve_prompt(self._config, texts, target_language))
             return response.text
 
         raw = await asyncio.get_event_loop().run_in_executor(None, _run)

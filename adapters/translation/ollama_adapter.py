@@ -11,6 +11,16 @@ _NUMBERED = re.compile(r"^\d+\.\s+(.*)", re.DOTALL)
 _DEFAULT_URL = "http://localhost:11434"
 
 
+def _resolve_prompt(config, texts: list[str], target_language: str) -> str:
+    if config.prompt_template:
+        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+        try:
+            return config.prompt_template.format(texts=numbered, target_language=target_language)
+        except (KeyError, ValueError):
+            pass
+    return _build_prompt(texts, target_language)
+
+
 def _build_prompt(texts: list[str], target_language: str) -> str:
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
     return (
@@ -47,7 +57,7 @@ class OllamaAdapter(TranslationPort):
                     "model": self._config.model,
                     "stream": False,
                     "messages": [
-                        {"role": "user", "content": _build_prompt(texts, target_language)}
+                        {"role": "user", "content": _resolve_prompt(self._config, texts, target_language)}
                     ],
                 },
             )

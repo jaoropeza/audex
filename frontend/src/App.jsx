@@ -5,9 +5,13 @@ import LiveViewer from "./components/LiveViewer";
 import RecordingPanel from "./components/RecordingPanel";
 import ModelConfig from "./components/ModelConfig";
 import { useRecording } from "./hooks/useRecording";
-import styles from "./styles/App.module.css";
 
-const TABS = ["Viewer", "Live", "Recording", "Settings"];
+const TABS = [
+  { id: "Viewer",    label: "Viewer",    icon: "📄" },
+  { id: "Live",      label: "Live",      icon: "📡" },
+  { id: "Recording", label: "Record",    icon: "🎙" },
+  { id: "Settings",  label: "Settings",  icon: "⚙" },
+];
 
 function getInitialTheme() {
   const stored = localStorage.getItem("theme");
@@ -23,7 +27,13 @@ export default function App() {
   const { status: recording, start, stop, refreshStatus } = useRecording();
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
+    const root = document.documentElement;
+    if (theme === "dark") {
+      root.classList.add("dark");
+    } else {
+      root.classList.remove("dark");
+    }
+    root.setAttribute("data-theme", theme);
     localStorage.setItem("theme", theme);
   }, [theme]);
 
@@ -55,55 +65,79 @@ export default function App() {
   }
 
   return (
-    <div className={styles.app}>
-      <header className={styles.header}>
-        <span className={styles.logo}>🎙 STT</span>
-        <nav className={styles.tabs}>
-          {TABS.map((tab) => (
+    <div className="flex flex-col h-screen overflow-hidden bg-white dark:bg-gray-900">
+      {/* ── Header ── */}
+      <header className="flex items-center h-12 shrink-0 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 px-4 z-10">
+        {/* Logo */}
+        <span className="font-bold text-gray-900 dark:text-white mr-5 text-sm tracking-tight whitespace-nowrap">
+          🎙 STT
+        </span>
+
+        {/* Tabs */}
+        <nav className="flex gap-1 flex-1">
+          {TABS.map(({ id, label, icon }) => (
             <button
-              key={tab}
-              className={`${styles.tab} ${activeTab === tab ? styles.tabActive : ""}`}
-              onClick={() => setActiveTab(tab)}
+              key={id}
+              onClick={() => setActiveTab(id)}
+              className={[
+                "px-3 py-1.5 rounded-md text-sm font-medium transition-colors duration-100",
+                activeTab === id
+                  ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-sm"
+                  : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-white/60 dark:hover:bg-gray-700/50",
+              ].join(" ")}
             >
-              {tab}
+              <span className="hidden sm:inline mr-1">{icon}</span>
+              {label}
             </button>
           ))}
         </nav>
-        <div className={styles.headerRight}>
+
+        {/* Right controls */}
+        <div className="flex items-center gap-3 ml-auto">
           {recording.running && (
-            <span className={styles.recBadge}>
-              <span className={styles.recDot} /> REC
+            <span className="flex items-center gap-1.5 bg-red-500 text-white text-xs font-bold px-2.5 py-1 rounded-full animate-pulse">
+              <span className="w-1.5 h-1.5 rounded-full bg-white" />
+              REC
             </span>
           )}
-          <button className={styles.themeBtn} onClick={toggleTheme} title="Toggle theme">
+          <button
+            onClick={toggleTheme}
+            title="Toggle theme"
+            className="p-1.5 rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-600 transition-colors text-sm"
+          >
             {theme === "dark" ? "☀" : "🌙"}
           </button>
         </div>
       </header>
 
-      <aside className={styles.sidebar}>
-        <TranscriptList
-          selected={selectedFile}
-          onSelect={handleSelect}
-          onLive={handleLive}
-          liveFile={recording.output_file}
-        />
-      </aside>
+      {/* ── Body ── */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar */}
+        <aside className="w-64 shrink-0 border-r border-gray-200 dark:border-gray-700 flex flex-col overflow-hidden bg-gray-50 dark:bg-gray-800">
+          <TranscriptList
+            selected={selectedFile}
+            onSelect={handleSelect}
+            onLive={handleLive}
+            liveFile={recording.output_file}
+          />
+        </aside>
 
-      <main className={styles.main}>
-        {activeTab === "Viewer" && (
-          <TranscriptViewer filename={selectedFile} />
-        )}
-        {activeTab === "Live" && (
-          <LiveViewer filename={selectedFile || recording.output_file} isRecording={recording.running} />
-        )}
-        {activeTab === "Recording" && (
-          <RecordingPanel recording={recording} onStart={handleStart} onStop={handleStop} />
-        )}
-        {activeTab === "Settings" && (
-          <ModelConfig />
-        )}
-      </main>
+        {/* Main */}
+        <main className="flex-1 overflow-hidden flex flex-col bg-white dark:bg-gray-900">
+          {activeTab === "Viewer" && (
+            <TranscriptViewer filename={selectedFile} />
+          )}
+          {activeTab === "Live" && (
+            <LiveViewer filename={selectedFile || recording.output_file} isRecording={recording.running} onStop={handleStop} />
+          )}
+          {activeTab === "Recording" && (
+            <RecordingPanel recording={recording} onStart={handleStart} onStop={handleStop} />
+          )}
+          {activeTab === "Settings" && (
+            <ModelConfig />
+          )}
+        </main>
+      </div>
     </div>
   );
 }

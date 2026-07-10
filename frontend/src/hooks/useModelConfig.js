@@ -5,8 +5,8 @@ export function useModelConfig() {
   const [loading, setLoading]     = useState(false);
   const [saving, setSaving]       = useState(false);
   const [error, setError]         = useState(null);
-  const [testResults, setTestResults] = useState({ stt: null, translation: null });
-  const [testing, setTesting]     = useState({ stt: false, translation: false });
+  const [testResults, setTestResults] = useState({ stt: null, translation: null, summary: null });
+  const [testing, setTesting]     = useState({ stt: false, translation: false, summary: false });
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -47,11 +47,17 @@ export function useModelConfig() {
     }
   }, []);
 
-  const test = useCallback(async (type) => {
+  // draftConfig: the full draft AppSettings object from the UI (may differ from saved config)
+  const test = useCallback(async (type, draftConfig) => {
     setTesting((t) => ({ ...t, [type]: true }));
     setTestResults((r) => ({ ...r, [type]: null }));
     try {
-      const res = await fetch(`/api/config/test/${type}`, { method: "POST" });
+      const section = draftConfig?.[type]; // "stt", "translation", or "summary"
+      const res = await fetch(`/api/config/test/${type}`, {
+        method: "POST",
+        headers: section ? { "Content-Type": "application/json" } : {},
+        body:    section ? JSON.stringify(section) : undefined,
+      });
       const data = await res.json();
       setTestResults((r) => ({ ...r, [type]: data }));
     } catch (e) {
