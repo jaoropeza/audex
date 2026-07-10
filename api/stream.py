@@ -5,15 +5,21 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 router = APIRouter()
-PROJECT_DIR = Path(__file__).parent.parent
+PROJECT_DIR     = Path(__file__).parent.parent
+TRANSCRIPTS_DIR = PROJECT_DIR / "transcripts"
+
+
+def _resolve(filename: str) -> Path:
+    """Return path in transcripts/ if it exists, else fall back to project root."""
+    p = TRANSCRIPTS_DIR / filename
+    if p.exists():
+        return p
+    return PROJECT_DIR / filename
 
 
 def _is_safe(filename: str) -> bool:
-    try:
-        target = (PROJECT_DIR / filename).resolve()
-        return target.parent == PROJECT_DIR.resolve() and target.suffix == ".txt"
-    except Exception:
-        return False
+    p = Path(filename)
+    return p.name == filename and p.suffix == ".txt"
 
 
 @router.get("/{filename}")
@@ -25,7 +31,7 @@ async def stream_transcript(
     if not _is_safe(filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    filepath = PROJECT_DIR / filename
+    filepath = _resolve(filename)
 
     async def event_generator():
         # Wait up to 10 s for the file to appear (model loading delay)

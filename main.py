@@ -408,8 +408,8 @@ def run_recording(stt_adapter, audio_adapter, output_path, args, audio_saver, su
     stop_event  = threading.Event()
     threads     = []
 
-    # Audio capture thread
-    threads.append(threading.Thread(
+    # Audio capture thread (index 0 — joined before saving audio)
+    audio_thread = threading.Thread(
         target=audio_adapter.stream,
         kwargs=dict(
             audio_queue=audio_queue,
@@ -420,7 +420,8 @@ def run_recording(stt_adapter, audio_adapter, output_path, args, audio_saver, su
             audio_saver=audio_saver,
         ),
         daemon=True,
-    ))
+    )
+    threads.append(audio_thread)
 
     # Transcription thread
     if args.diarize:
@@ -449,17 +450,32 @@ def run_recording(stt_adapter, audio_adapter, output_path, args, audio_saver, su
     for t in threads:
         t.start()
 
+    # Sentinel file: api/recording.py writes this instead of CTRL_BREAK
+    # (CTRL_BREAK is intercepted by the Intel Fortran runtime and kills the process)
+    stop_file = Path(output_path).with_suffix(".stop")
+
     try:
         while not stop_event.is_set():
             time.sleep(0.5)
+            if stop_file.exists():
+                try:
+                    stop_file.unlink()
+                except OSError:
+                    pass
+                print("\n[INFO] Stop requested.")
+                break
     except KeyboardInterrupt:
         print("\n[INFO] Stopping…")
-        stop_event.set()
     finally:
+        stop_event.set()
         audio_adapter.close()
+        audio_thread.join(timeout=8)
         print(f"[INFO] Done. Transcript saved to: {output_path}")
         if audio_saver:
-            audio_saver.save()
+            try:
+                audio_saver.save()
+            except Exception as exc:
+                print(f"[ERROR] Failed to save audio: {exc}")
         if summarizer:
             summarizer.summarize(output_path)
 
@@ -536,7 +552,8 @@ def main():
 
     audio_saver = None
     if args.save_audio is not None:
-        audio_path  = _make_output_path(args.save_audio).replace(".txt", ".wav")
+        # Same folder and stem as the transcript; just swap the extension
+        audio_path = output_path.replace(".txt", ".wav")
         audio_saver = AudioSaver(audio_path)
         print(f"[INFO] Audio will be saved to: {audio_path}")
 

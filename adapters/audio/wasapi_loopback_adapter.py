@@ -117,6 +117,11 @@ class WASAPILoopbackAdapter(AudioCapturePort):
         stream.stop_stream()
         stream.close()
         p.terminate()
+
+        # Flush any partial buffer (< chunk_seconds) to audio_saver
+        if audio_saver and buf:
+            audio_saver.write(buf)
+
         stop_event.set()
 
     def _find_device(self, p):

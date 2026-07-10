@@ -110,6 +110,10 @@ class DShowMicAdapter(AudioCapturePort):
                     audio_saver.write(raw_chunk)
                 previous_overlap = raw_chunk[-overlap_bytes:] if len(raw_chunk) >= overlap_bytes else raw_chunk
 
+        # Flush any partial buffer (< chunk_seconds) to audio_saver
+        if audio_saver and buf:
+            audio_saver.write(buf)
+
         stop_event.set()
 
     def close(self) -> None:

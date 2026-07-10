@@ -1,21 +1,49 @@
 from __future__ import annotations
 
+import re
+import shutil
 from pathlib import Path
 from typing import Optional
+
+# Only migrate files produced by _make_output_path: {prefix}_{YYYYMMDD}_{HHMMSS}.txt
+_TRANSCRIPT_RE = re.compile(r'.+_\d{8}_\d{6}(\.txt|\.wav)$')
 
 from adapters.db.sqlite_adapter import SQLiteAdapter, init_db
 from adapters.db.chroma_adapter import ChromaAdapter
 
-_PROJECT_DIR = Path(__file__).parent.parent
+PROJECT_DIR     = Path(__file__).parent.parent
+TRANSCRIPTS_DIR = PROJECT_DIR / "transcripts"
 
 _sqlite = SQLiteAdapter()
 _chroma = ChromaAdapter()
 
 
 def startup_index() -> None:
-    """Scan existing .txt files on first startup and index into SQLite + ChromaDB."""
+    """
+    On first startup:
+    1. Ensure the transcripts/ folder exists.
+    2. Migrate existing .txt files from the project root into transcripts/.
+    3. Index all transcripts into SQLite + ChromaDB.
+    """
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
-    for path in sorted(_PROJECT_DIR.glob("*.txt")):
+
+    # Migrate legacy transcript/audio files from project root.
+    # Only touch files that match the timestamped naming pattern to avoid
+    # accidentally moving config files like requirements.txt.
+    for path in list(PROJECT_DIR.iterdir()):
+        if not path.is_file():
+            continue
+        if not _TRANSCRIPT_RE.match(path.name):
+            continue
+        dest = TRANSCRIPTS_DIR / path.name
+        if not dest.exists():
+            shutil.move(str(path), str(dest))
+        else:
+            path.unlink(missing_ok=True)
+
+    # Index all transcripts in transcripts/
+    for path in sorted(TRANSCRIPTS_DIR.glob("*.txt")):
         if path.name.endswith("_summary.txt"):
             continue
         lines: list[str] = []
@@ -28,7 +56,7 @@ def startup_index() -> None:
         try:
             _chroma.index(path.name, lines)
         except RuntimeError:
-            pass  # chromadb unavailable — skip silently
+            pass
 
 
 class DBService:
@@ -58,3 +86,12 @@ class DBService:
 
     def list_transcriptions(self) -> list[dict]:
         return _sqlite.list_transcriptions()
+
+    def set_tags(self, filename: str, tags: list[str]) -> None:
+        _sqlite.set_tags(filename, tags)
+
+    def get_tags(self, filename: str) -> list[str]:
+        return _sqlite.get_tags(filename)
+
+    def all_distinct_tags(self) -> list[str]:
+        return _sqlite.all_distinct_tags()

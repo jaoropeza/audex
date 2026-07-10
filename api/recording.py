@@ -3,7 +3,6 @@ import collections
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -130,7 +129,11 @@ async def start_recording(req: StartRequest):
     cmd += ["--model", model]
     if language and language != "auto":
         cmd += ["--language", language]
-    cmd += ["--output", req.output_prefix]
+    # Write transcripts into the dedicated transcripts/ subfolder
+    transcripts_dir = PROJECT_DIR / "transcripts"
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(transcripts_dir / req.output_prefix)
+    cmd += ["--output", output_path]
 
     if req.diarize:
         cmd.append("--diarize")
@@ -160,7 +163,6 @@ async def start_recording(req: StartRequest):
         bufsize=1,
         cwd=str(PROJECT_DIR),
         env=env,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     _pid = _process.pid
 
@@ -190,17 +192,54 @@ async def stop_recording():
     loop = asyncio.get_event_loop()
 
     def _stop():
+        # Write a sentinel file instead of CTRL_BREAK_EVENT.
+        # The Intel Fortran runtime (bundled with NumPy / ONNX) intercepts
+        # CTRL_BREAK and calls TerminateProcess(), bypassing Python's finally blocks.
+        stop_file = None
+        if _active_file:
+            stop_file = Path(_active_file).with_suffix(".stop")
+            try:
+                stop_file.write_text("stop")
+            except Exception:
+                stop_file = None
+
+        # Give main.py up to 30 s to finish cleanup (model flush + WAV write)
         try:
-            _process.send_signal(signal.CTRL_BREAK_EVENT)
-            _process.wait(timeout=10)
+            _process.wait(timeout=30)
         except Exception:
+            # Timed out — fall back to forceful termination
             try:
                 _process.terminate()
-                _process.wait(timeout=3)
+                _process.wait(timeout=5)
             except Exception:
                 _process.kill()
 
+        # Remove the sentinel if main.py didn't delete it
+        if stop_file:
+            try:
+                stop_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     await loop.run_in_executor(None, _stop)
+
+    # Index the finished transcript into the vector DB
+    if _active_file:
+        def _index():
+            try:
+                from application.db_service import DBService, TRANSCRIPTS_DIR
+                fname = Path(_active_file).name
+                path  = TRANSCRIPTS_DIR / fname
+                if not path.exists():
+                    path = Path(_active_file)
+                if path.exists():
+                    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                        lines = [ln.rstrip() for ln in fh if ln.strip()]
+                    DBService().index(fname, lines)
+            except Exception:
+                pass
+        await loop.run_in_executor(None, _index)
+
     return {"status": "stopped"}
 
 
