@@ -3,6 +3,7 @@ import TranscriptLine from "./TranscriptLine";
 import SummarizeModal from "./SummarizeModal";
 import TranslateModal from "./TranslateModal";
 import { useTranslation } from "../hooks/useTranslation";
+import { parseLine } from "./TranscriptLine";
 
 const inputCls = "rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-400";
 const btnCls   = "rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500";
@@ -19,6 +20,86 @@ function tagColor(tag) {
   let h = 0;
   for (let i = 0; i < tag.length; i++) h = (h * 31 + tag.charCodeAt(i)) & 0xffff;
   return TAG_COLORS[h % TAG_COLORS.length];
+}
+
+// ── Group Picker ──────────────────────────────────────────────────────────────
+
+const GROUP_PRESETS = [
+  { label: "None", value: null },
+  { label: "30 s", value: 30 },
+  { label: "1 min", value: 60 },
+  { label: "5 min", value: 300 },
+];
+
+function GroupPicker({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [custom, setCustom] = useState("");
+  const ref = useRef(null);
+
+  useEffect(() => {
+    function handle(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    if (open) document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  const label = value == null ? "Group" : value >= 60 ? `${value / 60} min` : `${value} s`;
+  const active = value != null;
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={[
+          "flex items-center gap-1 text-xs px-2 py-1 rounded-md border transition-colors",
+          active || open
+            ? "border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-300"
+            : "border-gray-200 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 bg-white dark:bg-gray-700",
+        ].join(" ")}
+        title="Group transcript lines by time window"
+      >
+        ⏱ {label}
+      </button>
+
+      {open && (
+        <div className="absolute left-0 top-full mt-1 z-20 w-52 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow-lg p-3">
+          <p className="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">Group by time window</p>
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {GROUP_PRESETS.map((p) => (
+              <button
+                key={String(p.value)}
+                onClick={() => { onChange(p.value); if (p.value !== null) setOpen(false); if (p.value === null) setOpen(false); }}
+                className={[
+                  "px-2.5 py-1 rounded-full text-xs font-medium border transition-colors",
+                  value === p.value
+                    ? "bg-blue-600 border-blue-600 text-white"
+                    : "border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-300 bg-white dark:bg-gray-700 hover:border-blue-400",
+                ].join(" ")}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <input
+              type="number"
+              min={5}
+              max={3600}
+              value={custom}
+              onChange={(e) => setCustom(e.target.value)}
+              placeholder="Custom (sec)"
+              className="flex-1 text-xs rounded border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-500 placeholder-gray-400"
+            />
+            <button
+              onClick={() => { const v = parseInt(custom, 10); if (v > 0) { onChange(v); setOpen(false); } }}
+              className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium"
+            >
+              Set
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Tag Editor ────────────────────────────────────────────────────────────────
@@ -140,9 +221,10 @@ export default function TranscriptViewer({ filename }) {
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [translateEnabled, setTranslateEnabled] = useState(false);
-  const [sourceLang, setSourceLang] = useState("Auto");
-  const [targetLang, setTargetLang] = useState("English");
+  const [sourceLang,    setSourceLang]    = useState("Auto");
+  const [targetLang,    setTargetLang]    = useState("English");
   const [promptTemplate, setPromptTemplate] = useState(null);
+  const [groupSeconds,  setGroupSeconds]  = useState(null);
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [searchResults, setSearchResults] = useState(null);
   const [activeTab, setActiveTab] = useState("transcript");
@@ -152,8 +234,8 @@ export default function TranscriptViewer({ filename }) {
   const [showSummarizeModal, setShowSummarizeModal] = useState(false);
   const [audioInfo, setAudioInfo] = useState(null); // null=loading, false=none, object=exists
 
-  const { translations, translating, error: translateError } = useTranslation(
-    lines, sourceLang, targetLang, promptTemplate, translateEnabled
+  const { translations, groups, translating, error: translateError } = useTranslation(
+    lines, sourceLang, targetLang, promptTemplate, groupSeconds, translateEnabled
   );
 
   useEffect(() => {
@@ -264,6 +346,8 @@ export default function TranscriptViewer({ filename }) {
                 Search
               </button>
             </form>
+            <GroupPicker value={groupSeconds} onChange={setGroupSeconds} />
+
             {!translateEnabled ? (
               <button
                 onClick={() => setShowTranslateModal(true)}
@@ -279,6 +363,7 @@ export default function TranscriptViewer({ filename }) {
                   title="Change translation settings"
                 >
                   🌐 {sourceLang === "Auto" ? "Auto" : sourceLang} → {targetLang}
+                  {groupSeconds ? <span className="ml-1 opacity-70">{groupSeconds >= 60 ? `${groupSeconds/60}m` : `${groupSeconds}s`}</span> : null}
                   {translating && <span className="ml-1 w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin" />}
                 </button>
                 <button
@@ -357,11 +442,22 @@ export default function TranscriptViewer({ filename }) {
               {searchResults ? "No matches found." : "Transcript is empty."}
             </div>
           )}
-          {displayLines.map((line, i) => (
+
+          {/* Grouped view — active whenever groupSeconds is set, with or without translation */}
+          {!loading && groupSeconds && !searchResults && (
+            <GroupedView
+              groups={groups}
+              translations={translateEnabled ? translations : {}}
+              translating={translateEnabled && translating}
+            />
+          )}
+
+          {/* Per-line view — when not grouped, or when a search is active */}
+          {!loading && (!groupSeconds || searchResults) && displayLines.map((line, i) => (
             <TranscriptLine
               key={i}
               raw={line}
-              translation={translateEnabled ? translations[line] : null}
+              translation={translateEnabled && !groupSeconds ? translations[line] : null}
               searchTerm={searchResults ? search : ""}
             />
           ))}
@@ -423,6 +519,55 @@ export default function TranscriptViewer({ filename }) {
         />
       )}
     </div>
+  );
+}
+
+// ── Grouped transcript view ───────────────────────────────────────────────────
+
+function extractTimestamp(raw) {
+  const m = raw.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+  return m ? m[1] : null;
+}
+
+function GroupedView({ groups, translations, translating }) {
+  return (
+    <>
+      {groups.map((group) => {
+        const translation = translations[group.key];
+        const firstTs = extractTimestamp(group.lines[0]);
+        const lastTs  = extractTimestamp(group.lines[group.lines.length - 1]);
+        const pending = !translation && translating;
+        const text    = group.lines.map((l) => parseLine(l).text).join(" ");
+
+        return (
+          <div key={group.key} className="border-b border-gray-100 dark:border-gray-800/60 px-4 py-2.5">
+            {/* Time-range header */}
+            {firstTs && (
+              <span className="font-mono text-[10px] text-gray-400 dark:text-gray-500 block mb-1">
+                {firstTs}{lastTs && lastTs !== firstTs ? ` — ${lastTs}` : ""}
+              </span>
+            )}
+
+            {/* Joined paragraph */}
+            <p className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed">{text}</p>
+
+            {/* Group-level translation block */}
+            {(translation || pending) && (
+              <div className="mt-2 px-3 py-2 rounded-md bg-blue-50 dark:bg-blue-900/20 border-l-2 border-blue-400 dark:border-blue-600">
+                {pending ? (
+                  <span className="flex items-center gap-1.5 text-xs text-gray-400 dark:text-gray-500">
+                    <span className="w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin shrink-0" />
+                    Translating…
+                  </span>
+                ) : (
+                  <p className="text-sm text-blue-800 dark:text-blue-200 leading-relaxed">{translation}</p>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </>
   );
 }
 

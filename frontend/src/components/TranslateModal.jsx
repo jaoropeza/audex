@@ -39,10 +39,10 @@ function LangPill({ label, active, onClick }) {
 }
 
 export default function TranslateModal({ lineCount, initialSource, initialTarget, initialPrompt, onClose, onApply }) {
-  const [sourceLang, setSourceLang] = useState(initialSource || "Auto");
-  const [targetLang, setTargetLang] = useState(initialTarget || "English");
-  const [showPrompt, setShowPrompt] = useState(false);
-  const [prompt, setPrompt] = useState(initialPrompt || "");
+  const [sourceLang,   setSourceLang]   = useState(initialSource || "Auto");
+  const [targetLang,   setTargetLang]   = useState(initialTarget || "English");
+  const [showPrompt,   setShowPrompt]   = useState(false);
+  const [prompt,       setPrompt]       = useState(initialPrompt || "");
 
   function handleApply() {
     onApply({
