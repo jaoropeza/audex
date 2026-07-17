@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { sseUrl } from "../utils/api";
 
 /**
  * Connects an EventSource to `url` and accumulates incoming "line" events.
@@ -25,7 +26,8 @@ export function useSSE(url, enabled = true) {
     }
 
     const fromLine = lastLineRef.current;
-    const fullUrl = fromLine > 0 ? `${url}?from_line=${fromLine}` : url;
+    const base    = sseUrl(url);   // appends ?token=...
+    const fullUrl = fromLine > 0 ? `${base}&from_line=${fromLine}` : base;
 
     setStatus("connecting");
     const es = new EventSource(fullUrl);

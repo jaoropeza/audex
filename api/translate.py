@@ -3,11 +3,13 @@ from __future__ import annotations
 import re
 import traceback
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 
 from application.config_service import ConfigService
 from application.translation_service import TranslationService
+from api.deps import get_current_user
+from domain.entities import User
 
 router = APIRouter()
 
@@ -29,8 +31,14 @@ class TranslateRequest(BaseModel):
         return v
 
 
-@router.post("/translate")
-async def translate_lines(req: TranslateRequest):
+@router.post(
+    "/translate",
+    summary="Translate a batch of transcript lines",
+    description="Strips timestamp/label prefixes before translating, then re-attaches them.",
+    tags=["translate"],
+    responses={401: {"description": "Not authenticated"}, 502: {"description": "Provider error"}},
+)
+async def translate_lines(req: TranslateRequest, current_user: User = Depends(get_current_user)):
     # Split [HH:MM:SS][LABEL] prefix from spoken text (API-layer concern)
     prefixes, contents = [], []
     for line in req.lines:
@@ -42,7 +50,7 @@ async def translate_lines(req: TranslateRequest):
             prefixes.append("")
             contents.append(line)
 
-    cfg = ConfigService().get()
+    cfg = ConfigService(current_user.id).get()
     service = TranslationService(cfg.translation)
 
     try:

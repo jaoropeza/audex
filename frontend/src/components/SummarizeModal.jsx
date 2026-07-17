@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { apiFetch } from "../utils/api";
 import { SUMMARY_PRESETS } from "./ModelConfig";
 
 const textareaCls =
@@ -37,7 +38,7 @@ export default function SummarizeModal({ filename, lineCount, onClose, onDone })
       const body = promptTemplate.trim()
         ? { prompt_template: promptTemplate }
         : {};
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/transcripts/${encodeURIComponent(filename)}/summarize`,
         {
           method: "POST",

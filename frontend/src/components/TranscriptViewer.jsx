@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { apiFetch } from "../utils/api";
 import TranscriptLine from "./TranscriptLine";
 import SummarizeModal from "./SummarizeModal";
 import TranslateModal from "./TranslateModal";
@@ -102,6 +103,191 @@ function GroupPicker({ value, onChange }) {
   );
 }
 
+// ── Download helpers ──────────────────────────────────────────────────────────
+
+function tsToSecs(ts) {
+  const [h, m, s] = ts.split(":").map(Number);
+  return h * 3600 + m * 60 + s;
+}
+function secsToVTT(secs) {
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}.000`;
+}
+function secsToSRT(secs) {
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")},000`;
+}
+function extractTs(raw) { const m = raw.match(/^\[(\d{2}:\d{2}:\d{2})\]/); return m ? m[1] : null; }
+
+function linesToVTT(filename, lines) {
+  const cues = [];
+  for (let i = 0; i < lines.length; i++) {
+    const ts = extractTs(lines[i]);
+    if (!ts) continue;
+    const { speaker, text } = parseLine(lines[i]);
+    if (!text) continue;
+    const start = tsToSecs(ts);
+    let end = start + 3;
+    for (let j = i + 1; j < lines.length; j++) { const nts = extractTs(lines[j]); if (nts) { end = tsToSecs(nts); break; } }
+    cues.push(`${secsToVTT(start)} --> ${secsToVTT(end)}\n${speaker ? `${speaker}: ` : ""}${text}`);
+  }
+  return `WEBVTT\nNOTE ${filename}\n\n${cues.join("\n\n")}`;
+}
+function linesToSRT(filename, lines) {
+  const cues = [];
+  let idx = 1;
+  for (let i = 0; i < lines.length; i++) {
+    const ts = extractTs(lines[i]);
+    if (!ts) continue;
+    const { speaker, text } = parseLine(lines[i]);
+    if (!text) continue;
+    const start = tsToSecs(ts);
+    let end = start + 3;
+    for (let j = i + 1; j < lines.length; j++) { const nts = extractTs(lines[j]); if (nts) { end = tsToSecs(nts); break; } }
+    cues.push(`${idx}\n${secsToSRT(start)} --> ${secsToSRT(end)}\n${speaker ? `${speaker}: ` : ""}${text}`);
+    idx++;
+  }
+  return cues.join("\n\n");
+}
+function triggerDownload(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement("a"), { href: url, download: filename });
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── Download Menu ─────────────────────────────────────────────────────────────
+
+function DownloadMenu({ filename, lines }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  const base = filename.replace(/\.txt$/, "");
+
+  useEffect(() => {
+    function handle(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    if (open) document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  function downloadAs(fmt) {
+    setOpen(false);
+    if (fmt === "txt") triggerDownload(lines.join("\n"), `${base}.txt`, "text/plain");
+    else if (fmt === "vtt") triggerDownload(linesToVTT(filename, lines), `${base}.vtt`, "text/vtt");
+    else if (fmt === "srt") triggerDownload(linesToSRT(filename, lines), `${base}.srt`, "text/plain");
+  }
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        disabled={lines.length === 0}
+        title="Export transcript"
+        className="flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-gray-200 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 bg-white dark:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+      >
+        ↓ Export
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-20 w-40 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow-lg overflow-hidden">
+          {[["txt", "Plain text (.txt)"], ["vtt", "WebVTT (.vtt)"], ["srt", "SubRip (.srt)"]].map(([fmt, label]) => (
+            <button
+              key={fmt}
+              onClick={() => downloadAs(fmt)}
+              className="w-full text-left px-3 py-2 text-xs text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Category Picker ───────────────────────────────────────────────────────────
+
+function CategoryPicker({ filename }) {
+  const [cats,     setCats]     = useState([]);
+  const [selected, setSelected] = useState(new Set());
+  const [open,     setOpen]     = useState(false);
+  const [saving,   setSaving]   = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!filename) return;
+    apiFetch("/api/categories").then((r) => r.ok ? r.json() : []).then(setCats).catch(() => {});
+    apiFetch(`/api/transcripts/${encodeURIComponent(filename)}/categories`)
+      .then((r) => r.ok ? r.json() : [])
+      .then((assigned) => setSelected(new Set(assigned.map((c) => c.id))))
+      .catch(() => {});
+  }, [filename]);
+
+  useEffect(() => {
+    function handle(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    if (open) document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  async function toggleCat(id) {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSelected(next);
+    setSaving(true);
+    try {
+      await apiFetch(`/api/transcripts/${encodeURIComponent(filename)}/categories`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ category_ids: [...next] }),
+      });
+    } finally { setSaving(false); }
+  }
+
+  if (cats.length === 0) return null;
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        title="Categories"
+        className={[
+          "flex items-center gap-1 text-xs px-2 py-1 rounded-md border transition-colors",
+          open || selected.size > 0
+            ? "border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-300"
+            : "border-gray-200 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500",
+        ].join(" ")}
+      >
+        📂 {selected.size > 0 ? <span>{selected.size}</span> : null}
+        {saving && <span className="w-2.5 h-2.5 border border-current border-t-transparent rounded-full animate-spin" />}
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full mt-1 z-20 w-52 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow-lg p-2">
+          <p className="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-1.5 px-1">
+            Assign categories
+          </p>
+          {cats.map((cat) => (
+            <label
+              key={cat.id}
+              className="flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(cat.id)}
+                onChange={() => toggleCat(cat.id)}
+                className="w-3.5 h-3.5 rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500"
+              />
+              <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: cat.color }} />
+              <span className="text-xs text-gray-700 dark:text-gray-200 truncate">{cat.name}</span>
+            </label>
+          ))}
+          {cats.length === 0 && (
+            <p className="text-[10px] text-gray-400 px-2 py-1">No categories — create them in the Categories tab.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Tag Editor ────────────────────────────────────────────────────────────────
 
 function TagEditor({ filename }) {
@@ -113,7 +299,7 @@ function TagEditor({ filename }) {
 
   useEffect(() => {
     if (!filename) return;
-    fetch(`/api/transcripts/${encodeURIComponent(filename)}/tags`)
+    apiFetch(`/api/transcripts/${encodeURIComponent(filename)}/tags`)
       .then((r) => r.ok ? r.json() : { tags: [] })
       .then((d) => setTags(d.tags || []))
       .catch(() => setTags([]));
@@ -129,7 +315,7 @@ function TagEditor({ filename }) {
   async function save(newTags) {
     setSaving(true);
     try {
-      const res = await fetch(`/api/transcripts/${encodeURIComponent(filename)}/tags`, {
+      const res = await apiFetch(`/api/transcripts/${encodeURIComponent(filename)}/tags`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tags: newTags }),
@@ -233,6 +419,7 @@ export default function TranscriptViewer({ filename }) {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [showSummarizeModal, setShowSummarizeModal] = useState(false);
   const [audioInfo, setAudioInfo] = useState(null); // null=loading, false=none, object=exists
+  const [error, setError] = useState(null);
 
   const { translations, groups, translating, error: translateError } = useTranslation(
     lines, sourceLang, targetLang, promptTemplate, groupSeconds, translateEnabled
@@ -245,22 +432,32 @@ export default function TranscriptViewer({ filename }) {
     setSearchResults(null);
     setSummary(null);
     setAudioInfo(null);
+    setError(null);
     setActiveTab("transcript");
     // Check for paired audio file
-    fetch(`/api/transcripts/${encodeURIComponent(filename)}/audio/info`)
+    apiFetch(`/api/transcripts/${encodeURIComponent(filename)}/audio/info`)
       .then((r) => r.ok ? r.json() : { exists: false })
       .then((d) => setAudioInfo(d.exists ? d : false))
       .catch(() => setAudioInfo(false));
-    fetch(`/api/transcripts/${encodeURIComponent(filename)}`)
-      .then((r) => r.json())
-      .then(({ lines: l }) => { setLines(l); setLoading(false); })
-      .catch(() => setLoading(false));
+    apiFetch(`/api/transcripts/${encodeURIComponent(filename)}`)
+      .then(async (r) => {
+        if (!r.ok) {
+          const detail = await r.json().then((d) => d.detail || r.statusText).catch(() => r.statusText);
+          setError(`Error ${r.status}: ${detail}`);
+          setLoading(false);
+          return;
+        }
+        const { lines: l } = await r.json();
+        setLines(l);
+        setLoading(false);
+      })
+      .catch((err) => { setError(err.message || "Failed to load transcript"); setLoading(false); });
   }, [filename]);
 
   useEffect(() => {
     if (activeTab !== "summary" || !filename || summary !== null) return;
     setSummaryLoading(true);
-    fetch(`/api/transcripts/${encodeURIComponent(filename)}/summary`)
+    apiFetch(`/api/transcripts/${encodeURIComponent(filename)}/summary`)
       .then((r) => r.ok ? r.json() : null)
       .then((data) => { setSummary(data ? data.summary_text : ""); setSummaryLoading(false); })
       .catch(() => { setSummary(""); setSummaryLoading(false); });
@@ -269,7 +466,7 @@ export default function TranscriptViewer({ filename }) {
   async function handleSearch(e) {
     e.preventDefault();
     if (!search.trim()) { setSearchResults(null); return; }
-    const res = await fetch(
+    const res = await apiFetch(
       `/api/transcripts/${encodeURIComponent(filename)}/search?q=${encodeURIComponent(search)}`
     );
     const { matches } = await res.json();
@@ -331,6 +528,12 @@ export default function TranscriptViewer({ filename }) {
 
         {/* Tag editor (always visible) */}
         <TagEditor filename={filename} />
+
+        {/* Category picker (always visible) */}
+        <CategoryPicker filename={filename} />
+
+        {/* Export menu (always visible, disabled until content loaded) */}
+        <DownloadMenu filename={filename} lines={lines} />
 
         {activeTab === "transcript" && (
           <>
@@ -415,6 +618,20 @@ export default function TranscriptViewer({ filename }) {
           >
             ↓
           </a>
+        </div>
+      )}
+
+      {/* Error banner */}
+      {error && (
+        <div className="flex items-center gap-2 px-4 py-2 bg-red-50 dark:bg-red-900/20 border-b border-red-200 dark:border-red-800 text-xs text-red-700 dark:text-red-300 shrink-0">
+          <span className="shrink-0">⚠</span>
+          <span className="flex-1">{error}</span>
+          <button
+            onClick={() => setError(null)}
+            className="text-red-400 hover:text-red-600 dark:hover:text-red-200 font-medium shrink-0"
+          >
+            ✕
+          </button>
         </div>
       )}
 

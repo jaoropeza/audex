@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { apiFetch } from "../utils/api";
 
 /**
  * Manages recording session: start, stop, and polls /api/recording/status
@@ -15,7 +16,7 @@ export function useRecording() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch("/api/recording/status");
+      const res = await apiFetch("/api/recording/status");
       if (res.ok) setStatus(await res.json());
     } catch {
       // ignore network errors during polling
@@ -38,7 +39,7 @@ export function useRecording() {
   const start = useCallback(async (config) => {
     setError(null);
     try {
-      const res = await fetch("/api/recording/start", {
+      const res = await apiFetch("/api/recording/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
@@ -56,7 +57,7 @@ export function useRecording() {
   const stop = useCallback(async () => {
     setError(null);
     try {
-      const res = await fetch("/api/recording/stop", { method: "POST" });
+      const res = await apiFetch("/api/recording/stop", { method: "POST" });
       if (!res.ok) {
         const data = await res.json();
         throw new Error(data.detail ?? "Failed to stop");

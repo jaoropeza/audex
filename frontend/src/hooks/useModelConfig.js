@@ -1,4 +1,5 @@
 import { useState, useCallback } from "react";
+import { apiFetch } from "../utils/api";
 
 export function useModelConfig() {
   const [config, setConfig]       = useState(null);
@@ -12,7 +13,7 @@ export function useModelConfig() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/config");
+      const res = await apiFetch("/api/config");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setConfig(data);
@@ -27,7 +28,7 @@ export function useModelConfig() {
     setSaving(true);
     setError(null);
     try {
-      const res = await fetch("/api/config", {
+      const res = await apiFetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(newConfig),
@@ -53,7 +54,7 @@ export function useModelConfig() {
     setTestResults((r) => ({ ...r, [type]: null }));
     try {
       const section = draftConfig?.[type]; // "stt", "translation", or "summary"
-      const res = await fetch(`/api/config/test/${type}`, {
+      const res = await apiFetch(`/api/config/test/${type}`, {
         method: "POST",
         headers: section ? { "Content-Type": "application/json" } : {},
         body:    section ? JSON.stringify(section) : undefined,

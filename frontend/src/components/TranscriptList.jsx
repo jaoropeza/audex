@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { apiFetch } from "../utils/api";
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -56,7 +57,7 @@ export default function TranscriptList({ selected, onSelect, onLive, liveFile })
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/transcripts");
+      const res = await apiFetch("/api/transcripts");
       const { files: f } = await res.json();
       setFiles(f);
     } catch { /* ignore */ }
@@ -76,7 +77,7 @@ export default function TranscriptList({ selected, onSelect, onLive, liveFile })
     searchTimer.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const res = await fetch(`/api/db/search?q=${encodeURIComponent(searchQuery)}&n=10`);
+        const res = await apiFetch(`/api/db/search?q=${encodeURIComponent(searchQuery)}&n=10`);
         const data = await res.json();
         setSearchResults(data.results || []);
       } catch { setSearchResults([]); }
@@ -99,7 +100,7 @@ export default function TranscriptList({ selected, onSelect, onLive, liveFile })
     e.stopPropagation();
     if (!confirm(`Delete "${name}"?`)) return;
     setDeleting(name);
-    await fetch(`/api/transcripts/${encodeURIComponent(name)}`, { method: "DELETE" });
+    await apiFetch(`/api/transcripts/${encodeURIComponent(name)}`, { method: "DELETE" });
     setDeleting(null);
     load();
   }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { apiFetch } from "../utils/api";
 import { useModelConfig } from "../hooks/useModelConfig";
 
 const STT_PROVIDERS = [
@@ -193,6 +194,11 @@ export default function ModelConfig() {
           provider: "anthropic", model: "claude-haiku-4-5-20251001",
           api_url: null, api_key: null, prompt_template: null,
         },
+        embedding: config.embedding ?? {
+          enabled: false, provider: "none", model: "nomic-embed-text",
+          api_url: null, api_key: null,
+          chunk_strategy: "lines", chunk_size: 30, time_window_secs: 60,
+        },
       });
     }
   }, [config]);
@@ -200,6 +206,7 @@ export default function ModelConfig() {
   function setSTT(key, value)    { setDraft((d) => ({ ...d, stt:         { ...d.stt,         [key]: value } })); }
   function setTrans(key, value)  { setDraft((d) => ({ ...d, translation:  { ...d.translation,  [key]: value } })); }
   function setSummary(key, value){ setDraft((d) => ({ ...d, summary:      { ...d.summary,      [key]: value } })); }
+  function setEmbed(key, value)  { setDraft((d) => ({ ...d, embedding:    { ...d.embedding,    [key]: value } })); }
 
   async function handleSave() {
     setSaveStatus(null);
@@ -211,7 +218,7 @@ export default function ModelConfig() {
 
   async function handleReset() {
     try {
-      const res = await fetch("/api/config/reset", { method: "POST" });
+      const res = await apiFetch("/api/config/reset", { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setDraft(structuredClone(data));
@@ -238,6 +245,7 @@ export default function ModelConfig() {
   const stt   = draft.stt;
   const trans = draft.translation;
   const summ  = draft.summary;
+  const emb   = draft.embedding ?? { enabled: false, provider: "none", model: "nomic-embed-text", api_url: null, api_key: null, chunk_strategy: "lines", chunk_size: 30, time_window_secs: 60 };
 
   const sttNeedsApiUrl = stt.provider === "parakeet_nim";
   const sttNeedsApiKey = stt.provider !== "faster_whisper" && stt.provider !== "parakeet_nemo";
@@ -443,6 +451,124 @@ export default function ModelConfig() {
               <p className="mt-1 text-[10px] text-gray-400 dark:text-gray-500">Parameter: {"{transcript}"} — leave empty to use default</p>
             </div>
           </div>
+        </Card>
+
+        {/* ── Embeddings Card (full width) ── */}
+        <Card title="Embeddings (Semantic Search)">
+          <div className="flex items-center gap-3 mb-3">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={emb.enabled}
+                onChange={(e) => setEmbed("enabled", e.target.checked)}
+                className="rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500 w-4 h-4"
+              />
+              <span className="text-sm text-gray-700 dark:text-gray-300 font-medium">Enable vector embeddings</span>
+            </label>
+            {!emb.enabled && (
+              <span className="text-xs text-gray-400 dark:text-gray-500">
+                Enables semantic search across transcripts using AI embeddings
+              </span>
+            )}
+          </div>
+
+          {emb.enabled && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <Field label="Provider">
+                  <select className={fieldCls} value={emb.provider} onChange={(e) => setEmbed("provider", e.target.value)}>
+                    <option value="none">None (ChromaDB default)</option>
+                    <option value="ollama">Ollama (local)</option>
+                    <option value="openai">OpenAI / Compatible</option>
+                  </select>
+                </Field>
+
+                <Field label="Model" hint="e.g. nomic-embed-text, text-embedding-3-small">
+                  <input
+                    className={fieldCls}
+                    type="text"
+                    value={emb.model || ""}
+                    placeholder="nomic-embed-text"
+                    onChange={(e) => setEmbed("model", e.target.value)}
+                  />
+                </Field>
+              </div>
+
+              {(emb.provider === "ollama" || emb.provider === "openai") && (
+                <Field label="API URL">
+                  <input
+                    className={fieldCls}
+                    type="url"
+                    value={emb.api_url || ""}
+                    placeholder={emb.provider === "ollama" ? "http://localhost:11434" : "https://api.openai.com/v1"}
+                    onChange={(e) => setEmbed("api_url", e.target.value || null)}
+                  />
+                </Field>
+              )}
+
+              {emb.provider === "openai" && (
+                <Field label="API Key">
+                  <input
+                    className={fieldCls}
+                    type="password"
+                    value={emb.api_key || ""}
+                    placeholder={emb.api_key === "***" ? "key saved — leave blank to keep" : "sk-…"}
+                    onChange={(e) => setEmbed("api_key", e.target.value || null)}
+                    autoComplete="new-password"
+                  />
+                </Field>
+              )}
+
+              <div>
+                <label className={labelCls}>Chunk strategy</label>
+                <div className="flex rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700 w-fit">
+                  {[
+                    { value: "lines",        label: "Fixed lines" },
+                    { value: "speaker_turn", label: "Speaker turn" },
+                    { value: "time_window",  label: "Time window" },
+                  ].map(({ value, label }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setEmbed("chunk_strategy", value)}
+                      className={[
+                        "px-3 py-1.5 text-xs font-medium transition-colors focus:outline-none",
+                        emb.chunk_strategy === value
+                          ? "bg-blue-600 text-white"
+                          : "bg-white dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-600",
+                      ].join(" ")}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {emb.chunk_strategy === "lines" && (
+                <Field label="Chunk size (lines)" hint="Number of transcript lines per embedding chunk">
+                  <input
+                    className={`${fieldCls} max-w-[120px]`}
+                    type="number"
+                    min={1} max={200}
+                    value={emb.chunk_size || 30}
+                    onChange={(e) => setEmbed("chunk_size", parseInt(e.target.value) || 30)}
+                  />
+                </Field>
+              )}
+
+              {emb.chunk_strategy === "time_window" && (
+                <Field label="Time window (seconds)" hint="Group transcript lines within each N-second window">
+                  <input
+                    className={`${fieldCls} max-w-[120px]`}
+                    type="number"
+                    min={5} max={3600}
+                    value={emb.time_window_secs || 60}
+                    onChange={(e) => setEmbed("time_window_secs", parseInt(e.target.value) || 60)}
+                  />
+                </Field>
+              )}
+            </div>
+          )}
         </Card>
 
         {/* Actions */}

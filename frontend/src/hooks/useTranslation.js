@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { parseLine } from "../components/TranscriptLine";
+import { apiFetch } from "../utils/api";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,7 +45,7 @@ export function buildGroups(lines, groupSeconds) {
 // ── hook ──────────────────────────────────────────────────────────────────────
 
 async function callApi(texts, sourceLang, targetLang, promptTemplate) {
-  const res = await fetch("/api/translate", {
+  const res = await apiFetch("/api/translate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

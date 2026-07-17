@@ -92,13 +92,27 @@ class AudioSaver:
 # ── SpeakerTracker ────────────────────────────────────────────────────────────
 
 class SpeakerTracker:
-    def __init__(self, similarity_threshold=0.75):
-        self.profiles  = {}
-        self.named     = set()
-        self.threshold = similarity_threshold
-        self._counter  = 0
+    """
+    Identifies speakers across recording chunks using cosine similarity of
+    pyannote speaker embeddings.
 
-    def add_named_profile(self, name: str, embedding: np.ndarray):
+    Key design choices vs the naive approach:
+    - Threshold 0.65 (not 0.75): whole-chunk embeddings from 5-second clips
+      are less stable than full-session embeddings; 0.75 was too strict.
+    - Temporal continuity: if the best match is ambiguous (0.50–0.65),
+      keep the previous speaker rather than fragmenting identity.
+    - EMA update for anonymous speakers so their profile improves over time.
+    """
+
+    def __init__(self, similarity_threshold: float = 0.65):
+        self.profiles   = {}       # name -> normalized embedding (np.ndarray)
+        self.named      = set()    # names loaded from known (pre-labelled) profiles
+        self.threshold  = similarity_threshold
+        self._ambiguous = 0.50     # below this → definitely a new speaker
+        self._counter   = 0
+        self._last_speaker: str | None = None
+
+    def add_named_profile(self, name: str, embedding: np.ndarray) -> None:
         self.profiles[name] = self._norm(embedding)
         self.named.add(name)
 
@@ -109,14 +123,27 @@ class SpeakerTracker:
             sim = float(np.dot(emb, ref))
             if sim > best_sim:
                 best_sim, best_name = sim, name
+
         if best_name and best_sim >= self.threshold:
+            # Clear match — update anonymous profiles with EMA so they improve
             if best_name not in self.named:
-                updated = 0.9 * self.profiles[best_name] + 0.1 * emb
-                self.profiles[best_name] = self._norm(updated)
+                self.profiles[best_name] = self._norm(
+                    0.85 * self.profiles[best_name] + 0.15 * emb
+                )
+            self._last_speaker = best_name
             return best_name
+
+        # Ambiguous zone: prefer temporal continuity over creating a new speaker
+        if self._last_speaker and best_sim >= self._ambiguous:
+            last_sim = float(np.dot(emb, self.profiles.get(self._last_speaker, emb)))
+            if last_sim >= self._ambiguous:
+                return self._last_speaker
+
+        # Confident new speaker
         name = f"SPEAKER_{self._counter:02d}"
         self._counter += 1
         self.profiles[name] = emb.copy()
+        self._last_speaker = name
         return name
 
     @staticmethod
@@ -194,31 +221,41 @@ def _emb_to_numpy(emb) -> np.ndarray:
     return emb.squeeze().cpu().numpy().astype(np.float32)
 
 
-def load_diarization_models(hf_token: str, torch_device: str):
-    from pyannote.audio import Pipeline, Inference
+def load_diarization_models(hf_token: str):
+    """
+    Load only the speaker *embedding* model (not the full segmentation pipeline).
+
+    Running the full diarization pipeline on every 5-second chunk causes a
+    cold-start speaker-numbering problem: each chunk independently assigns
+    SPEAKER_00, SPEAKER_01 with no cross-chunk continuity.  Using only the
+    embedding model + SpeakerTracker gives stable speaker IDs across chunks
+    because the tracker compares cosine similarity against accumulated profiles.
+    """
+    from pyannote.audio import Inference
     from huggingface_hub import login
     import torch
 
     login(token=hf_token, add_to_git_credential=False)
-    print("[INFO] Loading diarization pipeline on CPU…", flush=True)
-    original = os.environ.get("CUDA_VISIBLE_DEVICES")
+    print("[INFO] Loading speaker embedding model…", flush=True)
+
+    # Force CPU so the embedding model doesn't compete with Whisper's GPU use.
+    saved = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-        pipeline.to(torch.device("cpu"))
-        print("[INFO] Loading speaker embedding model…", flush=True)
         embedding_model = Inference("pyannote/embedding", window="whole")
         embedding_model.to(torch.device("cpu"))
     finally:
-        if original is None:
+        if saved is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = original
-    print(f"[INFO] Diarization models ready (faster-whisper uses {torch_device}).")
-    return pipeline, embedding_model
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    print("[INFO] Speaker embedding model ready.")
+    return embedding_model
 
 
 def load_speaker_profiles(profiles_dir: str, embedding_model, tracker: SpeakerTracker):
+    """Load named speaker profiles from a directory of .wav files."""
     import torch
     try:
         import soundfile as sf
@@ -241,13 +278,18 @@ def load_speaker_profiles(profiles_dir: str, embedding_model, tracker: SpeakerTr
         print(f"[INFO] Speaker profile loaded: {name}")
 
 
-def _get_speaker_at(turns, start: float, end: float) -> str:
-    best_name, best_overlap = "UNKNOWN", 0.0
-    for t_start, t_end, name in turns:
-        overlap = max(0.0, min(t_end, end) - max(t_start, start))
-        if overlap > best_overlap:
-            best_overlap, best_name = overlap, name
-    return best_name
+def load_speaker_profiles_from_json(json_path: str, tracker: SpeakerTracker):
+    """Load pre-computed speaker embeddings from a JSON file (generated by the API)."""
+    import json
+    try:
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        for profile in data.get("profiles", []):
+            name = profile["name"]
+            emb  = np.array(profile["embedding"], dtype=np.float32)
+            tracker.add_named_profile(name, emb)
+            print(f"[INFO] Speaker profile loaded from DB: {name}")
+    except Exception as exc:
+        print(f"[WARN] Could not load speaker profiles JSON: {exc}")
 
 
 # ── Transcript helpers ────────────────────────────────────────────────────────
@@ -284,32 +326,25 @@ def _plain_transcription_loop(stt_adapter, audio_queue, stop_event, language, ou
 
 def _diarized_transcription_loop(
     stt_adapter, audio_queue, stop_event, language, output_file,
-    diarization_pipeline, embedding_model, speaker_tracker, num_speakers=None
+    embedding_model, speaker_tracker,
 ):
-    """Diarization loop: uses stt_adapter.transcribe_segments() + pyannote."""
+    """
+    Diarization loop using whole-chunk speaker embeddings.
+
+    Previous approach (per-chunk full diarization pipeline) caused a cold-start
+    problem: pyannote re-numbered speakers from SPEAKER_00 each chunk, so the
+    SpeakerTracker saw a different speaker every chunk even if it was the same
+    person.  The fix: run ONLY the embedding model on the whole chunk, then let
+    SpeakerTracker do the cross-chunk identity resolution via cosine similarity.
+    """
     import collections as _col
     import torch
     from adapters.stt.faster_whisper_adapter import (
         _clean_text, _is_hallucination, _strip_prefix_overlap,
     )
 
-    MIN_TURN_SECONDS = 0.5
-    recent_texts     = _col.deque(maxlen=3)
-    last_words: list = []
-
-    def flush(spk, words, label):
-        nonlocal last_words
-        text  = _strip_prefix_overlap(" ".join(words).strip(), last_words)
-        clean = _clean_text(text)
-        if _is_hallucination(text, recent_texts):
-            recent_texts.append(clean)
-            return
-        recent_texts.append(clean)
-        last_words = (last_words + text.split())[-20:]
-        ts   = datetime.now().strftime("%H:%M:%S")
-        line = _format_line(ts, label, spk, text)
-        print(line)
-        append_transcript(line, output_file)
+    recent_texts = _col.deque(maxlen=3)
+    last_words: list[str] = []
 
     while not stop_event.is_set():
         try:
@@ -321,52 +356,38 @@ def _diarized_transcription_loop(
         if arr.size == 0 or float(np.sqrt(np.mean(arr ** 2))) < 0.003:
             continue
 
+        # 1. Transcribe with Whisper (word timestamps)
         segments = stt_adapter.transcribe_segments(raw_audio, language)
         if not segments:
             continue
 
+        # 2. Embed the ENTIRE chunk → single stable speaker identity per chunk.
+        #    This avoids the cold-start numbering problem of per-chunk diarization.
         try:
-            waveform      = torch.from_numpy(arr).unsqueeze(0).float()
-            diarize_kwargs = {"min_speakers": 1, "max_speakers": num_speakers} if num_speakers else {}
-            diarization   = diarization_pipeline(
-                {"waveform": waveform, "sample_rate": SAMPLE_RATE},
-                **diarize_kwargs,
-            )
-            speaker_turns = []
-            for turn, _, _ in diarization.itertracks(yield_label=True):
-                if (turn.end - turn.start) < MIN_TURN_SECONDS:
-                    continue
-                s = int(turn.start * SAMPLE_RATE)
-                e = int(turn.end * SAMPLE_RATE)
-                turn_audio = arr[s:e]
-                if turn_audio.size == 0:
-                    continue
-                tw = torch.from_numpy(turn_audio).unsqueeze(0).float()
-                with torch.no_grad():
-                    emb = embedding_model({"waveform": tw, "sample_rate": SAMPLE_RATE})
-                resolved = speaker_tracker.match(_emb_to_numpy(emb))
-                speaker_turns.append((turn.start, turn.end, resolved))
+            waveform = torch.from_numpy(arr).unsqueeze(0).float()
+            with torch.no_grad():
+                emb = embedding_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
+            chunk_speaker = speaker_tracker.match(_emb_to_numpy(emb))
         except Exception as exc:
-            print(f"[ERROR] Diarization failed: {exc}")
-            continue
+            print(f"[WARN] Speaker embedding failed: {exc}")
+            chunk_speaker = speaker_tracker._last_speaker or "SPEAKER_00"
 
-        current_speaker, current_words = None, []
+        # 3. Emit transcript lines with hallucination suppression
         for seg in segments:
-            words = seg.words if seg.words else []
-            if not words:
-                spk = _get_speaker_at(speaker_turns, seg.start, seg.end)
-                if spk != current_speaker:
-                    flush(current_speaker, current_words, label)
-                    current_speaker, current_words = spk, []
-                current_words.append(seg.text.strip())
+            text = seg.text.strip()
+            if not text:
                 continue
-            for word in words:
-                spk = _get_speaker_at(speaker_turns, word.start, word.end)
-                if spk != current_speaker:
-                    flush(current_speaker, current_words, label)
-                    current_speaker, current_words = spk, []
-                current_words.append(word.word.strip())
-        flush(current_speaker, current_words, label)
+            text  = _strip_prefix_overlap(text, last_words)
+            clean = _clean_text(text)
+            if _is_hallucination(text, recent_texts):
+                recent_texts.append(clean)
+                continue
+            recent_texts.append(clean)
+            last_words = (last_words + text.split())[-20:]
+            ts   = datetime.now().strftime("%H:%M:%S")
+            line = _format_line(ts, label, chunk_speaker, text)
+            print(line)
+            append_transcript(line, output_file)
 
 
 # ── DI wiring helpers ─────────────────────────────────────────────────────────
@@ -429,15 +450,16 @@ def run_recording(stt_adapter, audio_adapter, output_path, args, audio_saver, su
         if not hf_token:
             print("[ERROR] Diarization requires a HuggingFace token.")
             sys.exit(1)
-        torch_device = "cuda" if _has_cuda() else "cpu"
-        pipeline, embedding_model = load_diarization_models(hf_token, torch_device)
-        tracker = SpeakerTracker(similarity_threshold=0.75)
+        embedding_model = load_diarization_models(hf_token)
+        tracker = SpeakerTracker(similarity_threshold=0.65)
         if args.speaker_profiles:
             load_speaker_profiles(args.speaker_profiles, embedding_model, tracker)
+        if args.speaker_profiles_json:
+            load_speaker_profiles_from_json(args.speaker_profiles_json, tracker)
         threads.append(threading.Thread(
             target=_diarized_transcription_loop,
             args=(stt_adapter, audio_queue, stop_event, args.language, output_path,
-                  pipeline, embedding_model, tracker, args.num_speakers),
+                  embedding_model, tracker),
             daemon=True,
         ))
     else:
@@ -514,6 +536,8 @@ def parse_args():
     parser.add_argument("--hf-token", type=str, default=None)
     parser.add_argument("--num-speakers", type=int, default=None)
     parser.add_argument("--speaker-profiles", type=str, default=None)
+    parser.add_argument("--speaker-profiles-json", type=str, default=None,
+                        help="Path to a JSON file with pre-computed speaker embeddings (generated by the web API)")
     parser.add_argument("--chunk", type=float, default=DEFAULT_CHUNK_SECONDS)
     parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP_SECONDS)
     parser.add_argument("--output", "-o", type=str, default=OUTPUT_PREFIX)

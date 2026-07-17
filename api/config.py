@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
@@ -8,13 +8,13 @@ from application.config_service import ConfigService
 from application.translation_service import TranslationService
 from application.stt_service import STTService
 from application.summary_service import SummaryService
+from api.deps import get_current_user
 from domain.entities import (
     AppSettings, STTConfig, TranslationConfig, SummaryConfig,
-    STTProvider, TranslationProvider, SummaryProvider,
+    STTProvider, TranslationProvider, SummaryProvider, User,
 )
 
 router = APIRouter()
-_svc = ConfigService()
 
 # ── Pydantic schemas (for request/response) ───────────────────────────────────
 
@@ -59,17 +59,10 @@ def _mask(settings: AppSettings) -> dict:
     return d
 
 
-def _schema_to_domain(schema: AppSettingsSchema) -> AppSettings:
-    current = _svc.get()
-    stt_key = schema.stt.api_key
-    if stt_key == "***":
-        stt_key = current.stt.api_key
-    trans_key = schema.translation.api_key
-    if trans_key == "***":
-        trans_key = current.translation.api_key
-    summ_key = schema.summary.api_key
-    if summ_key == "***":
-        summ_key = current.summary.api_key
+def _schema_to_domain(schema: AppSettingsSchema, current: AppSettings) -> AppSettings:
+    stt_key   = current.stt.api_key   if schema.stt.api_key   == "***" else (schema.stt.api_key   or None)
+    trans_key = current.translation.api_key if schema.translation.api_key == "***" else (schema.translation.api_key or None)
+    summ_key  = current.summary.api_key if schema.summary.api_key == "***" else (schema.summary.api_key  or None)
 
     return AppSettings(
         stt=STTConfig(
@@ -77,39 +70,52 @@ def _schema_to_domain(schema: AppSettingsSchema) -> AppSettings:
             model    = schema.stt.model,
             language = schema.stt.language,
             api_url  = schema.stt.api_url or None,
-            api_key  = stt_key or None,
+            api_key  = stt_key,
         ),
         translation=TranslationConfig(
             provider        = TranslationProvider(schema.translation.provider),
             model           = schema.translation.model,
             api_url         = schema.translation.api_url or None,
-            api_key         = trans_key or None,
+            api_key         = trans_key,
             prompt_template = schema.translation.prompt_template or None,
         ),
         summary=SummaryConfig(
             provider        = SummaryProvider(schema.summary.provider),
             model           = schema.summary.model,
             api_url         = schema.summary.api_url or None,
-            api_key         = summ_key or None,
+            api_key         = summ_key,
             prompt_template = schema.summary.prompt_template or None,
         ),
+        embedding=current.embedding,  # preserve embedding config on settings save
     )
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@router.get("/config")
-async def get_config():
-    return _mask(_svc.get())
+@router.get(
+    "/config",
+    summary="Get current user's provider configuration",
+    tags=["config"],
+    responses={401: {"description": "Not authenticated"}},
+)
+async def get_config(current_user: User = Depends(get_current_user)):
+    svc = ConfigService(current_user.id)
+    return _mask(svc.get())
 
 
-@router.put("/config")
-async def put_config(body: AppSettingsSchema):
+@router.put(
+    "/config",
+    summary="Save provider configuration for the current user",
+    tags=["config"],
+    responses={401: {"description": "Not authenticated"}},
+)
+async def put_config(body: AppSettingsSchema, current_user: User = Depends(get_current_user)):
+    svc = ConfigService(current_user.id)
     try:
-        settings = _schema_to_domain(body)
+        settings = _schema_to_domain(body, svc.get())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    _svc.save(settings)
+    svc.save(settings)
     return _mask(settings)
 
 
@@ -146,30 +152,57 @@ def _summary_schema_to_cfg(schema: SummaryConfigSchema, stored: SummaryConfig) -
     )
 
 
-@router.post("/config/test/translation")
-async def test_translation(body: Optional[TranslationConfigSchema] = None):
-    stored = _svc.get()
+@router.post(
+    "/config/test/translation",
+    summary="Test the translation provider configuration",
+    tags=["config"],
+    responses={401: {"description": "Not authenticated"}, 502: {"description": "Provider error"}},
+)
+async def test_translation(
+    body: Optional[TranslationConfigSchema] = None,
+    current_user: User = Depends(get_current_user),
+):
+    stored = ConfigService(current_user.id).get()
     cfg = _trans_schema_to_cfg(body, stored.translation) if body else stored.translation
-    result = await TranslationService(cfg).test()
-    return result
+    return await TranslationService(cfg).test()
 
 
-@router.post("/config/test/stt")
-async def test_stt(body: Optional[STTConfigSchema] = None):
-    stored = _svc.get()
+@router.post(
+    "/config/test/stt",
+    summary="Test the STT provider configuration",
+    tags=["config"],
+    responses={401: {"description": "Not authenticated"}, 502: {"description": "Provider error"}},
+)
+async def test_stt(
+    body: Optional[STTConfigSchema] = None,
+    current_user: User = Depends(get_current_user),
+):
+    stored = ConfigService(current_user.id).get()
     cfg = _stt_schema_to_cfg(body, stored.stt) if body else stored.stt
-    result = await STTService(cfg).test()
-    return result
+    return await STTService(cfg).test()
 
 
-@router.post("/config/test/summary")
-async def test_summary(body: Optional[SummaryConfigSchema] = None):
-    stored = _svc.get()
+@router.post(
+    "/config/test/summary",
+    summary="Test the summary provider configuration",
+    tags=["config"],
+    responses={401: {"description": "Not authenticated"}, 502: {"description": "Provider error"}},
+)
+async def test_summary(
+    body: Optional[SummaryConfigSchema] = None,
+    current_user: User = Depends(get_current_user),
+):
+    stored = ConfigService(current_user.id).get()
     cfg = _summary_schema_to_cfg(body, stored.summary) if body else stored.summary
-    result = await SummaryService(cfg).test()
-    return result
+    return await SummaryService(cfg).test()
 
 
-@router.post("/config/reset")
-async def reset_config():
-    return _mask(_svc.reset())
+@router.post(
+    "/config/reset",
+    summary="Reset configuration to global defaults (removes per-user overrides)",
+    tags=["config"],
+    responses={401: {"description": "Not authenticated"}},
+)
+async def reset_config(current_user: User = Depends(get_current_user)):
+    svc = ConfigService(current_user.id)
+    return _mask(svc.reset())

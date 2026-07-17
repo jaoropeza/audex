@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useSSE } from "../hooks/useSSE";
+import { apiFetch } from "../utils/api";
 
 const selectCls = "w-full rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed";
 const inputCls  = "w-full rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed";
@@ -33,9 +34,9 @@ export default function RecordingPanel({ recording, onStart, onStop }) {
 
   useEffect(() => {
     setLoadingDevices(true);
-    fetch("/api/recording/devices")
-      .then((r) => r.json())
-      .then((d) => { setDevices(d); setLoadingDevices(false); })
+    apiFetch("/api/recording/devices")
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d) setDevices(d); setLoadingDevices(false); })
       .catch(() => setLoadingDevices(false));
   }, []);
 

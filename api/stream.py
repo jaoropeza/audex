@@ -1,20 +1,18 @@
 import asyncio
 import json
+import os
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Query, Request
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+
+from api.deps import get_user_from_token_param
+from domain.entities import User
 
 router = APIRouter()
 PROJECT_DIR     = Path(__file__).parent.parent
-TRANSCRIPTS_DIR = PROJECT_DIR / "transcripts"
-
-
-def _resolve(filename: str) -> Path:
-    """Return path in transcripts/ if it exists, else fall back to project root."""
-    p = TRANSCRIPTS_DIR / filename
-    if p.exists():
-        return p
-    return PROJECT_DIR / filename
+_default_td     = PROJECT_DIR / "transcripts"
+TRANSCRIPTS_DIR = Path(os.environ.get("STT_TRANSCRIPTS_DIR", str(_default_td)))
 
 
 def _is_safe(filename: str) -> bool:
@@ -22,16 +20,36 @@ def _is_safe(filename: str) -> bool:
     return p.name == filename and p.suffix == ".txt"
 
 
-@router.get("/{filename}")
+def _resolve(filename: str, user_id: int) -> Path:
+    """Check user subdir first, then shared transcripts/, then project root."""
+    for base in (TRANSCRIPTS_DIR / str(user_id), TRANSCRIPTS_DIR, PROJECT_DIR):
+        p = base / filename
+        if p.exists():
+            return p
+    # Return user-subdir path even if it doesn't exist yet (will be waited for)
+    return TRANSCRIPTS_DIR / str(user_id) / filename
+
+
+@router.get(
+    "/{filename}",
+    summary="Stream live transcript lines via SSE",
+    description="Use ?token=<jwt> since EventSource cannot send Authorization headers.",
+    tags=["stream"],
+    responses={
+        400: {"description": "Invalid filename"},
+        401: {"description": "Not authenticated"},
+    },
+)
 async def stream_transcript(
     filename: str,
     request: Request,
     from_line: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_user_from_token_param),
 ):
     if not _is_safe(filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    filepath = _resolve(filename)
+    filepath = _resolve(filename, current_user.id)
 
     async def event_generator():
         # Wait up to 10 s for the file to appear (model loading delay)
@@ -61,7 +79,7 @@ async def stream_transcript(
             pos = f.tell()
 
         # ── Phase 2: tail ─────────────────────────────────────────────────
-        ping_ticks = 0
+        ping_ticks   = 0
         stable_ticks = 0
 
         while True:
@@ -110,6 +128,6 @@ async def stream_transcript(
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
+            "Connection":      "keep-alive",
         },
     )

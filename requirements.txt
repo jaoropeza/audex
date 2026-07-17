@@ -9,6 +9,15 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 
+# Auth
+bcrypt>=4.0.0
+python-jose[cryptography]>=3.3.0
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23
+anyio[trio]>=4.0
+
 # Multi-provider adapters
 openai>=1.50.0
 google-generativeai>=0.8.0

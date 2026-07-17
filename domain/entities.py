@@ -6,6 +6,76 @@ from enum import Enum
 from typing import Optional
 
 
+# ── Auth entities ─────────────────────────────────────────────────────────────
+
+class UserRole(str, Enum):
+    USER  = "user"
+    ADMIN = "admin"
+
+
+@dataclass
+class User:
+    id:            int
+    username:      str
+    email:         Optional[str]
+    hashed_pw:     str
+    role:          UserRole
+    is_active:     bool
+    settings_json: Optional[str]  # JSON string; None = use global default
+    created_at:    str
+
+
+# ── Transcript entity ─────────────────────────────────────────────────────────
+
+@dataclass
+class Transcript:
+    id:         int
+    user_id:    Optional[int]
+    filename:   str
+    content:    Optional[str]
+    created_at: str
+    indexed_at: str
+    line_count: int
+
+
+# ── Category entity ───────────────────────────────────────────────────────────
+
+@dataclass
+class Category:
+    id:          int
+    user_id:     int
+    name:        str
+    description: Optional[str]
+    color:       str
+    created_at:  str
+
+
+# ── Embedding config ──────────────────────────────────────────────────────────
+
+class EmbeddingProvider(str, Enum):
+    NONE   = "none"
+    OLLAMA = "ollama"
+    OPENAI = "openai"
+
+
+class EmbeddingChunkStrategy(str, Enum):
+    LINES        = "lines"
+    SPEAKER_TURN = "speaker_turn"
+    TIME_WINDOW  = "time_window"
+
+
+@dataclass
+class EmbeddingConfig:
+    enabled:          bool                   = False
+    provider:         EmbeddingProvider      = EmbeddingProvider.NONE
+    model:            str                    = "nomic-embed-text"
+    api_url:          Optional[str]          = None
+    api_key:          Optional[str]          = None
+    chunk_strategy:   EmbeddingChunkStrategy = EmbeddingChunkStrategy.LINES
+    chunk_size:       int                    = 30
+    time_window_secs: int                    = 60
+
+
 class STTProvider(str, Enum):
     FASTER_WHISPER = "faster_whisper"
     PARAKEET_NIM   = "parakeet_nim"
@@ -58,6 +128,7 @@ class AppSettings:
     stt:         STTConfig         = field(default_factory=STTConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
     summary:     SummaryConfig     = field(default_factory=SummaryConfig)
+    embedding:   EmbeddingConfig   = field(default_factory=EmbeddingConfig)
 
     def to_dict(self) -> dict:
         return {
@@ -82,6 +153,16 @@ class AppSettings:
                 "api_key":         self.summary.api_key,
                 "prompt_template": self.summary.prompt_template,
             },
+            "embedding": {
+                "enabled":          self.embedding.enabled,
+                "provider":         self.embedding.provider.value,
+                "model":            self.embedding.model,
+                "api_url":          self.embedding.api_url,
+                "api_key":          self.embedding.api_key,
+                "chunk_strategy":   self.embedding.chunk_strategy.value,
+                "chunk_size":       self.embedding.chunk_size,
+                "time_window_secs": self.embedding.time_window_secs,
+            },
         }
 
     @classmethod
@@ -89,6 +170,7 @@ class AppSettings:
         stt_d   = d.get("stt", {})
         trans_d = d.get("translation", {})
         summ_d  = d.get("summary", {})
+        emb_d   = d.get("embedding", {})
         return cls(
             stt=STTConfig(
                 provider = STTProvider(stt_d.get("provider", STTProvider.FASTER_WHISPER)),
@@ -110,5 +192,15 @@ class AppSettings:
                 api_url         = summ_d.get("api_url"),
                 api_key         = summ_d.get("api_key"),
                 prompt_template = summ_d.get("prompt_template"),
+            ),
+            embedding=EmbeddingConfig(
+                enabled          = bool(emb_d.get("enabled", False)),
+                provider         = EmbeddingProvider(emb_d.get("provider", EmbeddingProvider.NONE)),
+                model            = emb_d.get("model", "nomic-embed-text"),
+                api_url          = emb_d.get("api_url"),
+                api_key          = emb_d.get("api_key"),
+                chunk_strategy   = EmbeddingChunkStrategy(emb_d.get("chunk_strategy", EmbeddingChunkStrategy.LINES)),
+                chunk_size       = int(emb_d.get("chunk_size", 30)),
+                time_window_secs = int(emb_d.get("time_window_secs", 60)),
             ),
         )

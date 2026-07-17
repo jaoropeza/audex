@@ -1,28 +1,37 @@
 import asyncio
 import collections
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from api.deps import get_current_user, get_user_from_token_param
+from domain.entities import User
+
 router = APIRouter()
-PROJECT_DIR = Path(__file__).parent.parent
+logger = logging.getLogger("stt.recording")
+PROJECT_DIR     = Path(__file__).parent.parent
+_default_td     = PROJECT_DIR / "transcripts"
+TRANSCRIPTS_DIR = Path(os.environ.get("STT_TRANSCRIPTS_DIR", str(_default_td)))
 
 # ── Module-level state (single concurrent session) ────────────────────────────
-_process: Optional[subprocess.Popen] = None
-_active_file: Optional[str] = None          # absolute path
-_pid: Optional[int] = None
+_process:        Optional[subprocess.Popen] = None
+_active_file:    Optional[str]              = None   # absolute path
+_active_user_id: Optional[int]              = None   # user who started recording
+_pid:            Optional[int]              = None
 _log_buffer: collections.deque = collections.deque(maxlen=300)
-_log_event = threading.Event()              # set whenever a new line is appended
-_file_known = threading.Event()             # set when output path is discovered
+_log_event  = threading.Event()   # set whenever a new line is appended
+_file_known = threading.Event()   # set when output path is discovered
 
 
 def is_recording_running() -> bool:
@@ -46,9 +55,13 @@ def _drain_stdout(proc: subprocess.Popen):
 
 # ── Devices ──────────────────────────────────────────────────────────────────
 
-@router.get("/devices")
-async def list_devices():
-    """Shell out to main.py --list-devices to avoid importing torch in the server."""
+@router.get(
+    "/devices",
+    summary="List available audio input devices",
+    tags=["recording"],
+    responses={401: {"description": "Not authenticated"}},
+)
+async def list_devices(current_user: User = Depends(get_current_user)):
     loop = asyncio.get_event_loop()
 
     def _run():
@@ -83,22 +96,31 @@ async def list_devices():
 # ── Start recording ───────────────────────────────────────────────────────────
 
 class StartRequest(BaseModel):
-    mode: str                           # "mic" | "loopback" | "merge"
-    device: Optional[str] = None        # loopback device hint, or mic device
-    mic: Optional[str] = None           # merge mode mic
-    model: Optional[str] = None         # None → use saved STT config default
-    language: Optional[str] = None      # None → use saved STT config default
-    diarize: bool = False
-    hf_token: Optional[str] = None
-    num_speakers: Optional[int] = None
-    output_prefix: str = "transcript"
-    save_audio: bool = False
-    summarize: bool = False
+    mode:           str
+    device:         Optional[str] = None
+    mic:            Optional[str] = None
+    model:          Optional[str] = None
+    language:       Optional[str] = None
+    diarize:        bool          = False
+    hf_token:       Optional[str] = None
+    num_speakers:   Optional[int] = None
+    output_prefix:  str           = "transcript"
+    save_audio:     bool          = False
+    summarize:      bool          = False
 
 
-@router.post("/start")
-async def start_recording(req: StartRequest):
-    global _process, _active_file, _pid
+@router.post(
+    "/start",
+    summary="Start a recording session",
+    tags=["recording"],
+    responses={
+        401: {"description": "Not authenticated"},
+        409: {"description": "Recording already in progress"},
+        422: {"description": "Invalid request parameters"},
+    },
+)
+async def start_recording(req: StartRequest, current_user: User = Depends(get_current_user)):
+    global _process, _active_file, _active_user_id, _pid
 
     if is_recording_running():
         raise HTTPException(status_code=409, detail="Recording already in progress")
@@ -123,16 +145,17 @@ async def start_recording(req: StartRequest):
         raise HTTPException(status_code=422, detail=f"Unknown mode: {req.mode}")
 
     from application.config_service import ConfigService
-    stt_cfg = ConfigService().get().stt
+    stt_cfg  = ConfigService(current_user.id).get().stt
     model    = req.model    or stt_cfg.model    or "large-v3"
     language = req.language or stt_cfg.language or "es"
     cmd += ["--model", model]
     if language and language != "auto":
         cmd += ["--language", language]
-    # Write transcripts into the dedicated transcripts/ subfolder
-    transcripts_dir = PROJECT_DIR / "transcripts"
-    transcripts_dir.mkdir(parents=True, exist_ok=True)
-    output_path = str(transcripts_dir / req.output_prefix)
+
+    # Write transcripts into the user-specific subfolder
+    user_dir = TRANSCRIPTS_DIR / str(current_user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(user_dir / req.output_prefix)
     cmd += ["--output", output_path]
 
     if req.diarize:
@@ -143,12 +166,35 @@ async def start_recording(req: StartRequest):
         if req.num_speakers:
             cmd += ["--num-speakers", str(req.num_speakers)]
 
+        # Inject the user's named speaker profiles so they are resolved by name
+        # at recording time rather than appearing as anonymous SPEAKER_N labels.
+        try:
+            from adapters.db.speaker_adapter import SpeakerAdapter
+            profiles = SpeakerAdapter().get_embeddings_for_user(current_user.id)
+            if profiles:
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", delete=False, encoding="utf-8"
+                )
+                json.dump({"profiles": profiles}, tmp)
+                tmp.close()
+                cmd += ["--speaker-profiles-json", tmp.name]
+                # Clean up after main.py has had time to read it
+                def _cleanup(path):
+                    import time; time.sleep(10)
+                    try: os.unlink(path)
+                    except OSError: pass
+                threading.Thread(target=_cleanup, args=(tmp.name,), daemon=True).start()
+        except Exception:
+            pass
+
     if req.save_audio:
         cmd.append("--save-audio")
     if req.summarize:
         cmd.append("--summarize")
 
-    _active_file = None
+    logger.info("Starting recording: user=%d mode=%s model=%s", current_user.id, req.mode, model)
+    _active_file    = None
+    _active_user_id = current_user.id
     _file_known.clear()
     _log_buffer.clear()
 
@@ -168,7 +214,6 @@ async def start_recording(req: StartRequest):
 
     threading.Thread(target=_drain_stdout, args=(_process,), daemon=True).start()
 
-    # Wait up to 10 s for main.py to report the output filename
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _file_known.wait, 10.0)
 
@@ -177,14 +222,23 @@ async def start_recording(req: StartRequest):
         raise HTTPException(status_code=500, detail="Could not determine output file from main.py")
 
     filename = Path(_active_file).name
+    logger.info("Recording started: file=%s pid=%d user=%d", filename, _pid, current_user.id)
     return {"status": "started", "output_file": filename, "pid": _pid}
 
 
 # ── Stop recording ────────────────────────────────────────────────────────────
 
-@router.post("/stop")
-async def stop_recording():
-    global _process
+@router.post(
+    "/stop",
+    summary="Stop the current recording session and index the transcript",
+    tags=["recording"],
+    responses={
+        401: {"description": "Not authenticated"},
+        409: {"description": "No recording in progress"},
+    },
+)
+async def stop_recording(current_user: User = Depends(get_current_user)):
+    global _process, _active_user_id
 
     if not is_recording_running():
         raise HTTPException(status_code=409, detail="No recording in progress")
@@ -192,9 +246,6 @@ async def stop_recording():
     loop = asyncio.get_event_loop()
 
     def _stop():
-        # Write a sentinel file instead of CTRL_BREAK_EVENT.
-        # The Intel Fortran runtime (bundled with NumPy / ONNX) intercepts
-        # CTRL_BREAK and calls TerminateProcess(), bypassing Python's finally blocks.
         stop_file = None
         if _active_file:
             stop_file = Path(_active_file).with_suffix(".stop")
@@ -203,18 +254,15 @@ async def stop_recording():
             except Exception:
                 stop_file = None
 
-        # Give main.py up to 30 s to finish cleanup (model flush + WAV write)
         try:
             _process.wait(timeout=30)
         except Exception:
-            # Timed out — fall back to forceful termination
             try:
                 _process.terminate()
                 _process.wait(timeout=5)
             except Exception:
                 _process.kill()
 
-        # Remove the sentinel if main.py didn't delete it
         if stop_file:
             try:
                 stop_file.unlink(missing_ok=True)
@@ -223,39 +271,59 @@ async def stop_recording():
 
     await loop.run_in_executor(None, _stop)
 
-    # Index the finished transcript into the vector DB
+    # Index the finished transcript into the vector DB under the recording user
+    recorded_user_id = _active_user_id
     if _active_file:
+        active_file_snapshot = _active_file
+
         def _index():
             try:
-                from application.db_service import DBService, TRANSCRIPTS_DIR
-                fname = Path(_active_file).name
-                path  = TRANSCRIPTS_DIR / fname
+                from application.db_service import DBService
+                fname = Path(active_file_snapshot).name
+                path  = Path(active_file_snapshot)
                 if not path.exists():
-                    path = Path(_active_file)
+                    path = TRANSCRIPTS_DIR / str(recorded_user_id) / fname if recorded_user_id else TRANSCRIPTS_DIR / fname
                 if path.exists():
-                    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                        lines = [ln.rstrip() for ln in fh if ln.strip()]
-                    DBService().index(fname, lines)
+                    content = path.read_text(encoding="utf-8", errors="ignore")
+                    lines   = [ln.rstrip() for ln in content.splitlines() if ln.strip()]
+                    DBService().index(fname, lines, user_id=recorded_user_id)
             except Exception:
                 pass
+
         await loop.run_in_executor(None, _index)
 
+    logger.info("Recording stopped: file=%s user=%s", _active_file, recorded_user_id)
+    _active_user_id = None
     return {"status": "stopped"}
 
 
 # ── Status ────────────────────────────────────────────────────────────────────
 
-@router.get("/status")
-async def recording_status():
-    running = is_recording_running()
+@router.get(
+    "/status",
+    summary="Get current recording session status",
+    tags=["recording"],
+    responses={401: {"description": "Not authenticated"}},
+)
+async def recording_status(current_user: User = Depends(get_current_user)):
+    running  = is_recording_running()
     filename = Path(_active_file).name if running and _active_file else None
     return {"running": running, "output_file": filename, "pid": _pid if running else None}
 
 
 # ── Log SSE ───────────────────────────────────────────────────────────────────
 
-@router.get("/log")
-async def stream_log(request: Request):
+@router.get(
+    "/log",
+    summary="Stream recording process log lines via SSE",
+    description="Use ?token=<jwt> since EventSource cannot send Authorization headers.",
+    tags=["recording"],
+    responses={401: {"description": "Not authenticated"}},
+)
+async def stream_log(
+    request: Request,
+    current_user: User = Depends(get_user_from_token_param),
+):
     already_sent = 0
 
     async def gen():
